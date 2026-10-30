@@ -3,7 +3,7 @@
 //! While a thing is dragged only the links around it are re-routed.
 use crate::P;
 use opm_core::{
-    layout::{size, state_w},
+    layout::{size, state_w, MORE},
     Id, Kind, Link, LinkKind, Model, Thing,
 };
 use std::{
@@ -17,7 +17,8 @@ use std::{
 /// (state id, x, y, w, h) pills along the bottom of an object.
 pub fn state_boxes(t: &Thing) -> Vec<(Id, f64, f64, f64, f64)> {
     let (w, h) = size(t);
-    let total: f64 = t.states.iter().map(|s| state_w(&s.name) + 8.0).sum::<f64>() - 8.0;
+    let more = if t.more_states { state_w(MORE) + 8.0 } else { 0.0 };
+    let total: f64 = t.states.iter().map(|s| state_w(&s.name) + 8.0).sum::<f64>() + more - 8.0;
     let mut x = t.x + (w - total) / 2.0;
     Model::states_in_order(t)
         .into_iter()
@@ -28,6 +29,17 @@ pub fn state_boxes(t: &Thing) -> Vec<(Id, f64, f64, f64, f64)> {
             b
         })
         .collect()
+}
+
+/// (x, y, w, h) of the "…" pill standing for suppressed states: after the others.
+pub fn more_box(t: &Thing) -> Option<(f64, f64, f64, f64)> {
+    t.more_states.then_some(())?;
+    let (w, h) = size(t);
+    let x = match state_boxes(t).last() {
+        Some(b) => b.1 + b.3 + 8.0,
+        None => t.x + (w - state_w(MORE)) / 2.0,
+    };
+    Some((x, t.y + h - 40.0, state_w(MORE), 28.0))
 }
 
 pub struct Shape {

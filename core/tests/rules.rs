@@ -583,3 +583,55 @@ fn level_subprocesses_run_in_parallel_and_grouping_zooms_out() {
     assert_eq!(Sim::new(&m, z).order, vec![washing, polishing, sorting]);
     assert!(opm_core::sysml::export(&m).contains("first polishing then sorting;"));
 }
+
+#[test]
+fn suppressed_states_and_semi_folded_parts_belong_to_one_diagram() {
+    let mut m = Model::new("Car");
+    let sd = m.root();
+    let car = add(&mut m, "Car", Kind::Object);
+    let engine = add(&mut m, "Engine", Kind::Object);
+    let wheel = add(&mut m, "Wheel", Kind::Object);
+    let color = add(&mut m, "Color", Kind::Object);
+    let driving = add(&mut m, "Driving", Kind::Process);
+    let parked = m.apply(Op::AddState { thing: car, name: "parked".into() }).unwrap();
+    let moving = m.apply(Op::AddState { thing: car, name: "moving".into() }).unwrap();
+    let broken = m.apply(Op::AddState { thing: car, name: "broken".into() }).unwrap();
+    link(&mut m, car, engine, LinkKind::Aggregation).unwrap();
+    let w = link(&mut m, car, wheel, LinkKind::Aggregation).unwrap();
+    m.apply(Op::SetLink { id: w, states: None, modifier: None, multiplicity: Some("4".into()) }).unwrap();
+    link(&mut m, car, color, LinkKind::Exhibition).unwrap();
+    m.apply(Op::AddLink { from: car, to: driving, kind: LinkKind::Effect, from_state: Some(parked), to_state: Some(moving) }).unwrap();
+
+    // Suppressing: hidden unless a link here uses it.
+    for s in [broken, moving] {
+        m.apply(Op::HideState { opd: None, state: s, hidden: true }).unwrap();
+    }
+    let v = m.view(sd);
+    let c = v.thing(car).unwrap();
+    assert_eq!(c.states.iter().map(|s| s.id).collect::<Vec<_>>(), vec![parked, moving], "moving is used by a link here");
+    assert!(c.more_states);
+    let opl: Vec<_> = opl::render(&v).into_iter().map(|s| s.text).collect();
+    assert!(opl.contains(&"Car can be parked, moving, or other states.".to_string()), "{opl:?}");
+
+    // Semi-folding lists the parts this diagram doesn't draw, and the OPL keeps them.
+    let sd1 = m.apply(Op::Refine { thing: car, unfold: true, from: None }).unwrap();
+    m.apply(Op::Hide { opd: sd, thing: engine }).unwrap();
+    m.apply(Op::Hide { opd: sd, thing: color }).unwrap();
+    m.apply(Op::SemiFold { opd: None, thing: car, on: true }).unwrap();
+    let v = m.view(sd);
+    let c = v.thing(car).unwrap();
+    let names: Vec<_> = c.parts.iter().map(opm_core::layout::part_label).collect();
+    assert_eq!(names, ["Engine", "Color"], "Wheel is drawn here, so it isn't listed");
+    let (_, h) = opm_core::layout::size(c);
+    assert!(h > 96.0, "rows for the parts");
+    let opl: Vec<_> = opl::render(&v).into_iter().map(|s| s.text).collect();
+    assert!(opl.contains(&"Car consists of 4 Wheels and Engine.".to_string()), "{opl:?}");
+    assert!(opl.contains(&"Car exhibits Color.".to_string()), "{opl:?}");
+    // Only in that diagram.
+    assert!(m.view(sd1).thing(car).unwrap().parts.is_empty() && !m.view(sd1).thing(car).unwrap().more_states);
+    assert!(m.apply(Op::SemiFold { opd: None, thing: driving, on: true }).is_err());
+    m.validate().unwrap();
+    // Survives a save.
+    let back: Model = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+    assert_eq!(back.opd(sd).unwrap().semi, vec![car]);
+}

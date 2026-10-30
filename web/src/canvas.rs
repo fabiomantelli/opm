@@ -1,10 +1,10 @@
 //! The diagram: geometry, hit-testing, pointer/keyboard interaction, and the floating UI on the canvas.
 pub use crate::routes::LinkStyle;
-use crate::routes::{arc_of, clip, dist, pill_or_body, point_at, seg, shape_of, state_boxes, LinkGeo, Route, Routes};
+use crate::routes::{arc_of, clip, dist, more_box, pill_or_body, point_at, seg, shape_of, state_boxes, LinkGeo, Route, Routes};
 use crate::{storage, ui, Drag, Menu, Sel, Target, Ui, P};
 use leptos::{ev, prelude::*};
 use opm_core::{
-    layout::{frame_label_y, size},
+    layout::{frame_label_y, label_y, part_label, size, MORE, PARTS_TOP, PART_ROW},
     opl, valid_link_kinds, Affiliation, Essence, FanKind, Id, Kind, Link, LinkKind, Model, Modifier, Op, Thing,
 };
 use wasm_bindgen::JsCast;
@@ -184,6 +184,8 @@ impl Ui {
             inside: false,
             detail: None,
             state_order: vec![],
+            more_states: false,
+            parts: vec![],
         };
         let (w, h) = size(&probe);
         let (mut x, mut y) = at.unwrap_or_else(|| {
@@ -1001,7 +1003,31 @@ fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>, now: Option<Id>) -> A
         Kind::Object => view! { <rect x=t.x + dx y=t.y + dx width=w height=h rx="4" class=class /> }.into_any(),
         Kind::Process => view! { <ellipse cx=t.x + w / 2.0 + dx cy=t.y + h / 2.0 + dx rx=w / 2.0 ry=h / 2.0 class=class /> }.into_any(),
     };
-    let label_y = if t.states.is_empty() { t.y + h / 2.0 } else { t.y + 24.0 };
+    let label_y = label_y(t);
+    // Semi-folded: parts (filled triangle) and attributes (triangle in a triangle) listed under the name.
+    let parts = t
+        .parts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let (x, y) = (t.x + 16.0, t.y + PARTS_TOP + i as f64 * PART_ROW + PART_ROW / 2.0);
+            let tri = format!("M{x} {} L{} {} L{} {} Z", y - 5.0, x - 5.5, y + 4.5, x + 5.5, y + 4.5);
+            view! {
+                <g class="part">
+                    <path d=tri class=if p.attribute { "glyph attr" } else { "glyph" } />
+                    {p.attribute.then(|| view! { <path d=format!("M{x} {} L{} {} L{} {} Z", y - 1.0, x - 2.5, y + 3.0, x + 2.5, y + 3.0) class="glyph inner" /> })}
+                    <text x=x + 12.0 y=y dominant-baseline="central">{part_label(p)}</text>
+                </g>
+            }
+        })
+        .collect_view();
+    let more = more_box(t).map(|(x, y, sw, sh)| view! {
+        <g class="state more">
+            <title>"More states, hidden in this diagram (see the inspector)"</title>
+            <rect x=x y=y width=sw height=sh rx="12" />
+            <text x=x + sw / 2.0 y=y + sh / 2.0 text-anchor="middle" dominant-baseline="central">{MORE}</text>
+        </g>
+    });
     let states = state_boxes(t)
         .into_iter()
         .filter_map(|b| Some((b, t.states.iter().find(|s| s.id == b.0)?)))
@@ -1027,7 +1053,9 @@ fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>, now: Option<Id>) -> A
             {(t.essence == Essence::Physical).then(|| body(5.0, "shadow"))}
             {body(0.0, "body")}
             <text class="name" x=t.x + w / 2.0 y=label_y text-anchor="middle" dominant-baseline="central">{t.name.clone()}</text>
+            {parts}
             {states}
+            {more}
             {t.detail.is_some().then(|| view! { <title>"Double-click to open its detail diagram"</title> })}
         </g>
     }
@@ -1087,7 +1115,7 @@ pub fn Canvas() -> impl IntoView {
                     let ss = sel_state.filter(|s| t.states.iter().any(|x| x.id == *s));
                     let states: Vec<String> = t.states.iter().map(|s| format!("{}:{}:{}{}", s.id, s.name, s.initial, s.final_)).collect();
                     let key = format!(
-                        "{}|{}|{}|{}|{:?}|{:?}|{}|{cls}|{ss:?}|{now:?}|{:?}|{:?}",
+                        "{}|{}|{}|{}|{:?}|{:?}|{}|{cls}|{ss:?}|{now:?}|{:?}|{:?}|{:?}|{}|{:?}",
                         t.id,
                         t.x,
                         t.y,
@@ -1097,6 +1125,9 @@ pub fn Canvas() -> impl IntoView {
                         states.join(","),
                         t.frame,
                         t.detail,
+                        t.state_order,
+                        t.more_states,
+                        t.parts,
                     );
                     (key, t.clone(), cls, ss, now)
                 })
@@ -1522,9 +1553,8 @@ fn RenameBox() -> impl IntoView {
         let (name, (cx, cy), w) = ui.model.with_untracked(|m| {
             let m = m.as_ref()?;
             if let Some(t) = m.thing(id) {
-                let (w, h) = size(t);
-                let cy = if t.states.is_empty() { t.y + h / 2.0 } else { t.y + 24.0 };
-                Some((t.name.clone(), (t.x + w / 2.0, cy), w))
+                let (w, _) = size(t);
+                Some((t.name.clone(), (t.x + w / 2.0, label_y(t)), w))
             } else {
                 let (t, s) = m.state(id)?;
                 let b = state_boxes(t).into_iter().find(|b| b.0 == id)?;

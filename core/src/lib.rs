@@ -81,6 +81,12 @@ pub struct Thing {
     /// so their links don't cross. Empty = as listed. See `Model::order_states`.
     #[serde(default, skip_serializing)]
     pub state_order: Vec<Id>,
+    /// Some of its states are suppressed in this diagram.
+    #[serde(default, skip_serializing)]
+    pub more_states: bool,
+    /// Semi-folded in this diagram: parts and attributes listed inside it.
+    #[serde(default, skip_serializing)]
+    pub parts: Vec<Part>,
 }
 
 /// A thing shown in a diagram.
@@ -100,7 +106,7 @@ pub struct Shown {
 pub const PARALLEL: f64 = 20.0;
 
 /// An object-process diagram. The root (SD) has no parent and refines nothing.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Opd {
     pub id: Id,
     #[serde(default)]
@@ -115,6 +121,22 @@ pub struct Opd {
     /// Links routed by hand in this diagram.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<Route>,
+    /// States suppressed here (drawn as one "…" pill), unless a link here uses them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_states: Vec<Id>,
+    /// Objects semi-folded here: the parts and attributes this diagram doesn't show are listed inside them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semi: Vec<Id>,
+}
+
+/// A part or attribute listed inside a semi-folded object.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Part {
+    pub id: Id,
+    pub name: String,
+    /// Exhibition (an attribute or operation) rather than aggregation (a part).
+    pub attribute: bool,
+    pub multiplicity: String,
 }
 
 /// A link's route as the user shaped it in one diagram. Positions are model coordinates.
@@ -402,6 +424,20 @@ pub enum Op {
         things: Vec<Id>,
         name: String,
     },
+    /// Suppresses a state in diagram `opd` (default: the root), or shows it again.
+    HideState {
+        #[serde(default)]
+        opd: Option<Id>,
+        state: Id,
+        hidden: bool,
+    },
+    /// Semi-folds an object in diagram `opd` (its parts and attributes listed inside it), or unfolds it back.
+    SemiFold {
+        #[serde(default)]
+        opd: Option<Id>,
+        thing: Id,
+        on: bool,
+    },
     /// Thing (from the whole model, with its links and detail diagrams), state, link, or requirement.
     Remove { id: Id },
     /// Paste into `opd`: things (with states) and the links among them, carrying any ids, placed at
@@ -456,7 +492,7 @@ impl Model {
         if self.opds.is_empty() {
             let shows = self.things.iter().map(|t| Shown { thing: t.id, x: t.x, y: t.y, auto: t.auto, inside: false }).collect();
             let id = self.fresh();
-            self.opds.push(Opd { id, parent: None, refines: None, unfold: false, shows, routes: vec![] });
+            self.opds.push(Opd { id, parent: None, refines: None, unfold: false, shows, ..Default::default() });
         }
     }
 
@@ -629,6 +665,24 @@ impl Model {
             .collect();
         for l in &mut v.links {
             l.route = o.routes.iter().find(|r| r.link == l.id).cloned();
+        }
+        // Suppressed states (kept while a link here uses them) and semi-folded parts.
+        let used: HashSet<Id> = v.links.iter().flat_map(|l| [l.from_state, l.to_state]).flatten().collect();
+        for t in &mut v.things {
+            let n = t.states.len();
+            t.states.retain(|s| !o.hidden_states.contains(&s.id) || used.contains(&s.id));
+            t.more_states = t.states.len() < n;
+            if t.kind == Kind::Object && o.semi.contains(&t.id) {
+                t.parts = self
+                    .links
+                    .iter()
+                    .filter(|l| l.from == t.id && matches!(l.kind, LinkKind::Aggregation | LinkKind::Exhibition) && !shown.contains(&l.to))
+                    .filter_map(|l| {
+                        let p = self.thing(l.to)?;
+                        Some(Part { id: p.id, name: p.name.clone(), attribute: l.kind == LinkKind::Exhibition, multiplicity: l.multiplicity.clone() })
+                    })
+                    .collect();
+            }
         }
         v.fans = self.fans.clone();
         v.prune_fans();
@@ -820,6 +874,8 @@ impl Model {
                     inside: false,
                     detail: None,
                     state_order: vec![],
+                    more_states: false,
+                    parts: vec![],
                 });
                 let shown = Shown { thing: id, x: x.unwrap_or(ax), y: y.unwrap_or(ay), auto: x.is_none(), inside };
                 self.opd_mut(opd)?.shows.push(shown);
@@ -877,7 +933,7 @@ impl Model {
                     }
                 }
                 let id = self.fresh();
-                self.opds.push(Opd { id, parent: Some(parent), refines: Some(thing), unfold, shows, routes: vec![] });
+                self.opds.push(Opd { id, parent: Some(parent), refines: Some(thing), unfold, shows, ..Default::default() });
                 let moves = layout::tidy_opd(self, id);
                 let o = self.opd_mut(id)?;
                 for (t, x, y) in moves {
@@ -961,7 +1017,7 @@ impl Model {
                     }
                 }
                 let z = self.fresh();
-                self.opds.push(Opd { id: z, parent: Some(opd), refines: Some(p), unfold: false, shows, routes: vec![] });
+                self.opds.push(Opd { id: z, parent: Some(opd), refines: Some(p), unfold: false, shows, ..Default::default() });
                 for d in &mut self.opds {
                     if d.parent == Some(opd) && d.refines.is_some_and(|r| inner.contains(&r)) {
                         d.parent = Some(z);
@@ -1182,6 +1238,26 @@ impl Model {
                     r.text = t;
                 }
                 Ok(id)
+            }
+            Op::HideState { opd, state, hidden } => {
+                self.state(state).ok_or("no such state")?;
+                let o = self.opd_mut(opd.unwrap_or(self.root()))?;
+                o.hidden_states.retain(|&s| s != state);
+                if hidden {
+                    o.hidden_states.push(state);
+                }
+                Ok(state)
+            }
+            Op::SemiFold { opd, thing, on } => {
+                if self.thing(thing).ok_or("no such thing")?.kind != Kind::Object {
+                    return Err("only objects can be semi-folded".into());
+                }
+                let o = self.opd_mut(opd.unwrap_or(self.root()))?;
+                o.semi.retain(|&t| t != thing);
+                if on {
+                    o.semi.push(thing);
+                }
+                Ok(thing)
             }
             Op::Trace { requirement, thing, satisfies } => {
                 self.thing(thing).ok_or("no such thing")?;

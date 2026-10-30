@@ -108,6 +108,10 @@ pub fn render(m: &Model) -> Vec<Sentence> {
         let owner = m.links.iter().find(|l| l.to == t.id && l.kind == LinkKind::Exhibition).map(|l| name(l.from));
         match (t.states.as_slice(), owner) {
             ([], _) => {}
+            (ss, _) if t.more_states => {
+                let names: Vec<_> = ss.iter().map(|s| s.name.clone()).chain(["other states".to_string()]).collect();
+                out.push(Sentence { text: format!("{} can be {}.", t.name, list(&names, "or")), refs: vec![t.id] });
+            }
             ([s], Some(o)) => out.push(Sentence { text: format!("{} of {o} is {}.", t.name, s.name), refs: vec![t.id] }),
             ([s], None) => out.push(Sentence { text: format!("{} is {}.", t.name, s.name), refs: vec![t.id] }),
             (ss, _) => {
@@ -159,7 +163,11 @@ pub fn render(m: &Model) -> Vec<Sentence> {
         out.push(Sentence { text, refs });
     }
 
-    // Aggregation and exhibition are grouped per whole: "Car consists of Engine and Wheels."
+    // Aggregation and exhibition are grouped per whole: "Car consists of Engine and Wheels." Parts
+    // listed inside a semi-folded whole count too.
+    let folded = |whole: Id, is_agg: bool| -> Vec<String> {
+        m.thing(whole).map_or(vec![], |t| t.parts.iter().filter(|p| p.attribute != is_agg).map(|p| counted(&p.multiplicity, None, &p.name)).collect())
+    };
     let mut grouped: Vec<(Id, bool)> = vec![];
     for l in m.links.iter().filter(|l| m.fan_of(l.id).is_none()) {
         let group = match l.kind {
@@ -177,7 +185,7 @@ pub fn render(m: &Model) -> Vec<Sentence> {
                 .iter()
                 .filter(|o| o.from == l.from && o.kind == l.kind)
                 .collect();
-            let parts: Vec<_> = same.iter().map(|o| counted(&o.multiplicity, None, &name(o.to))).collect();
+            let parts: Vec<_> = same.iter().map(|o| counted(&o.multiplicity, None, &name(o.to))).chain(folded(l.from, is_agg)).collect();
             let verb = if is_agg { "consists of" } else { "exhibits" };
             let mut refs = vec![l.from];
             refs.extend(same.iter().flat_map(|o| [o.id, o.to]));
@@ -224,6 +232,15 @@ pub fn render(m: &Model) -> Vec<Sentence> {
             (_, Modifier::None) => format!("{p} {pred}."),
         };
         out.push(Sentence { text, refs: vec![l.from, l.id, l.to] });
+    }
+    // Semi-folded wholes whose parts are all folded (no structural link drawn here).
+    for t in m.things.iter().filter(|t| !t.parts.is_empty()) {
+        for (is_agg, verb) in [(true, "consists of"), (false, "exhibits")] {
+            let parts = folded(t.id, is_agg);
+            if !parts.is_empty() && !grouped.contains(&(t.id, is_agg)) {
+                out.push(Sentence { text: format!("{} {verb} {}.", t.name, list(&parts, "and")), refs: vec![t.id] });
+            }
+        }
     }
     out
 }

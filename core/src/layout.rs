@@ -18,11 +18,36 @@ pub fn size(t: &Thing) -> (f64, f64) {
     match t.kind {
         Kind::Process => ((text_w(&t.name, 7.8) + 64.0).max(132.0), 66.0),
         Kind::Object => {
-            let sw: f64 = t.states.iter().map(|s| state_w(&s.name) + 8.0).sum::<f64>() + 16.0;
-            let w = (text_w(&t.name, 7.8) + 44.0).max(120.0).max(sw);
-            (w, if t.states.is_empty() { 58.0 } else { 96.0 })
+            let more = if t.more_states { state_w(MORE) + 8.0 } else { 0.0 };
+            let sw: f64 = t.states.iter().map(|s| state_w(&s.name) + 8.0).sum::<f64>() + more + 16.0;
+            let pw = t.parts.iter().map(|p| text_w(&part_label(p), 7.0) + 48.0).fold(0.0, f64::max);
+            let w = (text_w(&t.name, 7.8) + 44.0).max(120.0).max(sw).max(pw);
+            let pills = !t.states.is_empty() || t.more_states;
+            let h = match (t.parts.len(), pills) {
+                (0, false) => 58.0,
+                (0, true) => 96.0,
+                (n, _) => PARTS_TOP + n as f64 * PART_ROW + if pills { 48.0 } else { 10.0 },
+            };
+            (w, h)
         }
     }
+}
+
+/// The pill standing for suppressed states.
+pub const MORE: &str = "…";
+/// Where a semi-folded object's part list starts (below its name), and each row's height.
+pub const PARTS_TOP: f64 = 42.0;
+pub const PART_ROW: f64 = 20.0;
+
+/// "4 Wheels", "Engine".
+pub fn part_label(p: &crate::Part) -> String {
+    if p.multiplicity.is_empty() { p.name.clone() } else { format!("{} {}", p.multiplicity, p.name) }
+}
+
+/// Center line of a thing's name: centered, or near the top when states or parts sit below it.
+pub fn label_y(t: &Thing) -> f64 {
+    let (_, h) = size(t);
+    if t.states.is_empty() && !t.more_states && t.parts.is_empty() { t.y + h / 2.0 } else { t.y + 24.0 }
 }
 
 /// Layered (Sugiyama) layout, flowing top to bottom: inputs above the processes that use them,

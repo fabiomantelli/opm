@@ -4,7 +4,7 @@ use gloo_net::{http::Request, websocket::{futures::WebSocket, Message}};
 use gloo_timers::future::TimeoutFuture;
 use leptos::{ev, prelude::*, task::spawn_local};
 use canvas::{kind_label, Canvas};
-use opm_core::{layout::size, opl, Affiliation, Essence, FanKind, Id, Kind, Model, Modifier, Op};
+use opm_core::{layout::size, opl, Affiliation, Essence, FanKind, Id, Kind, LinkKind, Model, Modifier, Op};
 
 mod canvas;
 mod files;
@@ -509,20 +509,64 @@ fn Inspector() -> impl IntoView {
                     let is_obj = t.kind == Kind::Object;
                     let phys = t.essence == Essence::Physical;
                     let env = t.affiliation == Affiliation::Environmental;
-                    let states = t
-                        .states
-                        .iter()
+                    let here = ui.here();
+                    // All its states (the view leaves out the ones suppressed here), whether this
+                    // diagram suppresses each, whether it is semi-folded here, and if it has parts at all.
+                    let (all_states, hidden, semi, has_parts) = ui.full.with(|f| {
+                        let f = f.as_ref()?;
+                        let o = f.opd(here)?;
+                        let has = f.links.iter().any(|l| l.from == id && matches!(l.kind, LinkKind::Aggregation | LinkKind::Exhibition));
+                        Some((f.thing(id)?.states.clone(), o.hidden_states.clone(), o.semi.contains(&id), has))
+                    })?;
+                    let states = all_states
+                        .into_iter()
                         .map(|s| {
                             let sid = s.id;
+                            let off = hidden.contains(&sid);
+                            let forced = off && t.states.iter().any(|x| x.id == sid);
+                            let tip = match (off, forced) {
+                                (false, _) => "Shown in this diagram: click to hide it here (suppress)",
+                                (true, false) => "Hidden in this diagram: click to show it here",
+                                (true, true) => "Hidden here, but still drawn: a link in this diagram uses it",
+                            };
                             view! {
-                                <span class="chip state-chip">
+                                <span class="chip state-chip" class:off=off>
+                                    <button class="eye" title=tip on:click=move |_| ui.send(vec![Op::HideState { opd: Some(here), state: sid, hidden: !off }], |_| {})>
+                                        <svg viewBox="0 0 24 24">
+                                            <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z" class="ic line" />
+                                            {if off { view! { <path d="M4 4l16 16" class="ic line" /> }.into_any() } else { view! { <circle cx="12" cy="12" r="2.6" class="ic line" /> }.into_any() }}
+                                        </svg>
+                                    </button>
                                     <span on:dblclick=move |_| { ui.select(Some(Sel::State(sid))); ui.edit.set(Some(sid)); }>{s.name.clone()}</span>
                                     <button title="Remove state" on:click=move |_| ui.send(vec![Op::Remove { id: sid }], |_| {})>"×"</button>
                                 </span>
                             }
                         })
                         .collect_view();
-                    let here = ui.here();
+                    // Semi-folding: list the parts not drawn here inside the object; a listed part can be drawn again.
+                    let below = (t.x, t.y + size(&t).1 + 50.0);
+                    let listed = t
+                        .parts
+                        .iter()
+                        .map(|p| {
+                            let pid = p.id;
+                            view! {
+                                <button class="chip link-chip" title="Draw it in this diagram"
+                                    on:click=move |_| ui.send(vec![Op::Show { opd: here, thing: pid, x: Some(below.0), y: Some(below.1), inside: Some(false) }], |_| {})>
+                                    {p.name.clone()} " ↧"
+                                </button>
+                            }
+                        })
+                        .collect_view();
+                    let set_semi = move |on: bool| ui.send(vec![Op::SemiFold { opd: Some(here), thing: id, on }], |_| {});
+                    let semi_row = (is_obj && (has_parts || semi)).then(|| view! {
+                        <div class="label">"Parts and attributes here"</div>
+                        <div class="seg">
+                            <button class:on=!semi title="Only parts drawn in this diagram show" on:click=move |_| set_semi(false)>"Drawn"</button>
+                            <button class:on=semi title="Semi-folding: parts not drawn here are listed inside the object" on:click=move |_| set_semi(true)>"Listed inside"</button>
+                        </div>
+                        {semi.then(|| view! { <div class="chips">{listed}</div> })}
+                    });
                     let (shown, zoom_here) = ui.full.with(|f| {
                         let f = f.as_ref()?;
                         let shown: Vec<(Id, String)> = f.shown_in(id).into_iter().map(|o| (o, f.label(o))).collect();
@@ -602,6 +646,7 @@ fn Inspector() -> impl IntoView {
                                     <button class="chip add" on:click=move |_| ui.add_state()>"+ state"</button>
                                 </div>
                             })}
+                            {semi_row}
                             <div class="label">"Satisfies"</div>
                             <div class="chips">{satisfies}</div>
                             <div class="label">"Shown in"</div>

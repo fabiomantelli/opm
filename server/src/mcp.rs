@@ -34,6 +34,8 @@ cutting:
 - group(things, name) is the reverse (out-zooming): it puts processes already drawn, and objects only they use, inside a
   new process with its own in-zoom diagram, and moves their outside links up to it. Use it to tidy a crowded diagram.
 - unfold(thing) opens a diagram for an object's (or process's) parts, attributes and specializations.
+- Keep detail diagrams readable: show_states=[...] draws only the states that matter there (the rest become '…');
+  semi_fold=true lists an object's parts/attributes inside its box instead of drawing each one.
 - Refine as deep as useful (SD1.1...), usually 2-3 levels.
 Link kinds (from -> to):
 - agent: human/actor object -> process ('Barista handles Brewing'); only for humans
@@ -156,6 +158,12 @@ pub struct ThingSpec {
     /// In an in-zoom diagram: the subprocess this one runs in parallel with (drawn level with it).
     #[serde(default)]
     parallel_with: Option<String>,
+    /// Objects: in this diagram draw only these states; the others show as one '…' pill (state suppression).
+    #[serde(default)]
+    show_states: Option<Vec<String>>,
+    /// Objects: list their parts and attributes not drawn in this diagram inside their box (semi-folding).
+    #[serde(default)]
+    semi_fold: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -400,6 +408,19 @@ impl Mcp {
                     let sid = sid.ok_or_else(|| format!("'{}' has no state '{s}'", t.name))?;
                     let (i, f) = if initial { (Some(true), None) } else { (None, Some(true)) };
                     m.apply(Op::SetState { id: sid, initial: i, final_: f })?;
+                }
+                if let Some(keep) = &t.show_states {
+                    let states = m.thing(id).unwrap().states.clone();
+                    if let Some(bad) = keep.iter().find(|k| !states.iter().any(|s| s.name.eq_ignore_ascii_case(k.trim()))) {
+                        return Err(format!("'{}' has no state '{bad}'", t.name));
+                    }
+                    for s in states {
+                        let hidden = !keep.iter().any(|k| s.name.eq_ignore_ascii_case(k.trim()));
+                        m.apply(Op::HideState { opd: Some(opd), state: s.id, hidden })?;
+                    }
+                }
+                if let Some(on) = t.semi_fold {
+                    m.apply(Op::SemiFold { opd: Some(opd), thing: id, on }).map_err(|e| format!("'{}': {e}", t.name))?;
                 }
             }
             auto_arrange(m, &touched)?;
