@@ -41,6 +41,24 @@ Ao iniciar, o servidor imprime o endereço do editor e a URL do MCP (com o token
 - `Del`: se o item aparece em outros diagramas, sai só deste; senão é apagado do modelo
   (o painel do item também tem "Delete from the whole model").
 - Estilo das setas (reta / curva / ângulo reto) no canto inferior direito; em ângulo reto elas desviam dos itens.
+- **`Ctrl+K`** (ou `/`, ou o botão *Find*): busca qualquer item, estado ou diagrama no modelo inteiro;
+  `Enter` abre o diagrama certo, centraliza e seleciona o item.
+
+## Detalhes das ligações e estados
+
+Selecione uma ligação; o painel mostra o que vale para ela:
+
+- **Trigger** – *Condition (c)*: o processo só acontece se o objeto existir (no estado de entrada); senão é
+  pulado. *Event (e)*: o objeto aparecer dispara o processo. Vale para agent, instrument, consumption e effect.
+  A letra **c** ou **e** aparece junto do processo.
+- **Multiplicity** – quantos do lado do objeto/parte: `4`, `0..1` (opcional), `1..*` (pelo menos um),
+  `2..5`, `*`. Aparece junto da ponta ("Car consists of 4 Wheels").
+- **Alternatives** – quando há outras ligações do mesmo tipo saindo do mesmo item: *Either (XOR)* = exatamente
+  uma acontece (um arco); *Or (OR)* = pelo menos uma (arco duplo). "Brewing yields either Espresso or Lungo."
+- **Input / Output state** – como antes, agora sem recriar a ligação.
+
+Selecione um estado para marcá-lo como **Initial** (borda grossa) ou **Final** (borda dupla).
+Um atributo com um só estado vira valor no OPL: "Weight of Car is heavy."
 
 ## Diagramas (OPDs)
 
@@ -122,7 +140,7 @@ arrastar à mão ficam onde você deixou; dali em diante a IA só encaixa os ite
 `T` (Tidy) reorganiza tudo e devolve o layout ao modo automático.
 
 Ferramentas que o ChatGPT recebe: `list_models`, `create_model`, `add_things` (num diagrama: `diagram="SD1"`),
-`add_links`, `zoom_in` e `unfold` (criam diagramas de detalhe), `remove` (do modelo, ou só de um diagrama),
+`add_links` (com `modifier` condition/event e `multiplicity`), `fan` (agrupa ligações em XOR/OR), `zoom_in` e `unfold` (criam diagramas de detalhe), `remove` (do modelo, ou só de um diagrama),
 `arrange` (reorganiza um diagrama inteiro) e `get_model` (árvore de diagramas, OPL de cada um e os checks).
 O guia que a IA recebe pede para nunca omitir itens para "caber": diagramas grandes viram refinamentos.
 

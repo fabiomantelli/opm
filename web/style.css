@@ -374,3 +374,20 @@ kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5p
 .version .by-ai { color: var(--accent); border-color: var(--accent); }
 .version .spacer { flex: 1; }
 .versions > .muted { padding: 10px; margin: 0; }
+
+/* condition/event marks, multiplicities, XOR/OR fans, initial/final states */
+.mod { font-size: 13px; font-weight: 700; font-style: italic; fill: var(--ink); pointer-events: none; }
+.card { font-size: 12px; font-weight: 600; fill: var(--ink); pointer-events: none; }
+.fan { fill: none; stroke: var(--ink); stroke-width: 1.6; pointer-events: none; }
+.state.initial > rect:first-child { stroke-width: 3.2; }
+.state .inner { fill: none; stroke: var(--state); stroke-width: 1.2; }
+
+/* finder (Ctrl+K) and inspector fields */
+.backdrop.top { align-items: flex-start; padding-top: 12vh; }
+.modal.finder { width: min(560px, 100%); padding: 10px; }
+.finder-input { width: 100%; box-sizing: border-box; font-size: 16px; border: 0; border-bottom: 1px solid var(--line); padding: 10px 12px 12px; background: transparent; color: var(--ink); outline: none; }
+.finder-list { max-height: 50vh; overflow-y: auto; margin-top: 6px; display: flex; flex-direction: column; }
+.finder-list > .muted { padding: 10px 12px; margin: 0; }
+.finder-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; text-align: left; border: 0; background: transparent; color: var(--ink); padding: 8px 12px; border-radius: 8px; font: inherit; cursor: pointer; }
+.finder-row.on { background: var(--accent-soft); }
+.field-input { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--bg); color: var(--ink); font: inherit; }

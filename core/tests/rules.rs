@@ -360,3 +360,52 @@ fn removing_a_refined_thing_removes_its_diagrams() {
     assert!(m.thing(engine).is_some(), "still shown in the SD");
     m.validate().unwrap();
 }
+
+#[test]
+fn conditions_events_multiplicity_fans_and_initial_states() {
+    use opm_core::{FanKind, Modifier};
+    let mut m = Model::new("Car Wash");
+    let (car, wheel, water, soap) = (add(&mut m, "Car", Kind::Object), add(&mut m, "Wheel", Kind::Object), add(&mut m, "Water", Kind::Object), add(&mut m, "Soap", Kind::Object));
+    let (washing, clean, dirty) = (add(&mut m, "Washing", Kind::Process), add(&mut m, "Clean Car", Kind::Object), add(&mut m, "Dirty Car", Kind::Object));
+    let wet = m.apply(Op::AddState { thing: car, name: "wet".into() }).unwrap();
+    let dry = m.apply(Op::AddState { thing: car, name: "dry".into() }).unwrap();
+    m.apply(Op::SetState { id: dry, initial: Some(true), final_: None }).unwrap();
+
+    let parts = link(&mut m, car, wheel, LinkKind::Aggregation).unwrap();
+    m.apply(Op::SetLink { id: parts, states: None, modifier: None, multiplicity: Some("4".into()) }).unwrap();
+    assert!(m.apply(Op::SetLink { id: parts, states: None, modifier: None, multiplicity: Some("lots".into()) }).is_err());
+    assert!(m.apply(Op::SetLink { id: parts, states: None, modifier: Some(Modifier::Event), multiplicity: None }).is_err(), "structural links have no events");
+
+    let uses = link(&mut m, water, washing, LinkKind::Consumption).unwrap();
+    m.apply(Op::SetLink { id: uses, states: None, modifier: Some(Modifier::Condition), multiplicity: None }).unwrap();
+    let soap_l = link(&mut m, soap, washing, LinkKind::Instrument).unwrap();
+    m.apply(Op::SetLink { id: soap_l, states: None, modifier: Some(Modifier::Event), multiplicity: None }).unwrap();
+    let fx = link(&mut m, car, washing, LinkKind::Effect).unwrap();
+    m.apply(Op::SetLink { id: fx, states: Some((Some(dry), Some(wet))), modifier: None, multiplicity: None }).unwrap();
+
+    let r1 = link(&mut m, washing, clean, LinkKind::Result).unwrap();
+    let r2 = link(&mut m, washing, dirty, LinkKind::Result).unwrap();
+    assert!(m.apply(Op::Fan { links: vec![r1, uses], kind: Some(FanKind::Xor) }).is_err(), "different kinds");
+    m.apply(Op::Fan { links: vec![r1, r2], kind: Some(FanKind::Xor) }).unwrap();
+
+    let text: Vec<String> = opl::render(&m.view(m.root())).into_iter().map(|s| s.text).collect();
+    for want in [
+        "State dry of Car is initial.",
+        "Car consists of 4 Wheels.",
+        "Washing occurs if Water exists, in which case Washing consumes Water, otherwise Washing is skipped.",
+        "Soap initiates Washing, which requires Soap.",
+        "Washing changes Car from dry to wet.",
+        "Washing yields either Clean Car or Dirty Car.",
+    ] {
+        assert!(text.iter().any(|t| t == want), "missing '{want}' in {text:#?}");
+    }
+    assert!(!text.iter().any(|t| t == "Washing yields Clean Car."), "fanned links read as one sentence");
+
+    // Deleting a fanned link dissolves the fan; the model stays valid through a JSON round trip.
+    m.apply(Op::Remove { id: r2 }).unwrap();
+    assert!(m.fans.is_empty());
+    let back: Model = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+    back.validate().unwrap();
+    assert_eq!(back, m);
+    let _ = wet;
+}

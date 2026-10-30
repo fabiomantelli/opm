@@ -1,6 +1,6 @@
 //! MCP tools so ChatGPT (or any MCP client) can build OPM models by name.
 use crate::App;
-use opm_core::{check::check, opl, Affiliation, Essence, Id, Kind, LinkKind, Model, Op};
+use opm_core::{check::check, opl, Affiliation, Essence, FanKind, Id, Kind, LinkKind, Model, Modifier, Op};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerConfig},
@@ -44,6 +44,13 @@ Link kinds (from -> to):
 - generalization: general -> specialization ('Sedan is a Car')
 - classification: class -> instance
 - tagged: any -> any with a custom 'tag' phrase
+Link details (add_links fields):
+- multiplicity on the object/part end: '4', '0..1' (optional), '1..*' (at least one), '2..5', '*' ('Car consists of 4 Wheels')
+- modifier 'condition' on agent/instrument/consumption/effect: the process runs only if the object exists (in from_state),
+  otherwise it is skipped ('Washing occurs if Water exists, ...'); 'event': the object (in from_state) starts the process.
+- alternatives: links of one kind sharing an end can be grouped with the fan tool: xor = exactly one ('Brewing yields either
+  Espresso or Lungo'), or = at least one.
+States: mark the starting state initial_state and end states final_states in add_things.
 Mark physical things physical=true and external ones environmental=true. Every process should transform at least one object
 (consumption, result or effect); avoid things with no links.";
 
@@ -133,6 +140,12 @@ pub struct ThingSpec {
     /// In an in-zoom diagram: inside the zoomed process (default: processes inside, objects outside).
     #[serde(default)]
     inside: Option<bool>,
+    /// The state it starts in (one of `states`).
+    #[serde(default)]
+    initial_state: Option<String>,
+    /// States it ends in.
+    #[serde(default)]
+    final_states: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -162,6 +175,28 @@ pub struct LinkSpec {
     /// Phrase for tagged links, e.g. "is connected to".
     #[serde(default)]
     tag: Option<String>,
+    /// "condition" or "event" (agent/instrument/consumption/effect only).
+    #[serde(default)]
+    modifier: Option<String>,
+    /// How many of the object/part end: "4", "0..1", "1..*", "2..5", "*".
+    #[serde(default)]
+    multiplicity: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct LinkRef {
+    from: String,
+    to: String,
+    kind: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct FanLinks {
+    model: String,
+    /// "xor" (exactly one), "or" (at least one), or "none" to ungroup.
+    kind: String,
+    /// Two or more existing links of the same kind that share one end.
+    links: Vec<LinkRef>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -199,6 +234,25 @@ fn link_kind(s: &str, tag: Option<String>) -> Result<LinkKind, String> {
         "classification" => Classification,
         "tagged" => Tagged(tag.unwrap_or_default()),
         other => return Err(format!("unknown link kind '{other}'")),
+    })
+}
+
+fn find_link(m: &Model, from: &str, to: &str, kind: &str) -> Result<Id, String> {
+    let (f, t, k) = (thing_id(m, from)?, thing_id(m, to)?, link_kind(kind, None)?);
+    m.links
+        .iter()
+        .find(|x| x.from == f && x.to == t && std::mem::discriminant(&x.kind) == std::mem::discriminant(&k))
+        .map(|l| l.id)
+        .ok_or_else(|| format!("no {kind} link {from} -> {to}"))
+}
+
+fn modifier(s: &Option<String>) -> Result<Option<Modifier>, String> {
+    Ok(match s.as_deref().map(|s| s.trim().to_lowercase()) {
+        None => None,
+        Some(s) if s.is_empty() || s == "none" => Some(Modifier::None),
+        Some(s) if s == "condition" => Some(Modifier::Condition),
+        Some(s) if s == "event" => Some(Modifier::Event),
+        Some(other) => return Err(format!("modifier must be condition or event, got '{other}'")),
     })
 }
 
@@ -287,6 +341,13 @@ impl Mcp {
                         m.apply(Op::AddState { thing: id, name: s }).map_err(|e| format!("'{}': {e}", t.name))?;
                     }
                 }
+                let marks = t.initial_state.iter().map(|s| (s, true)).chain(t.final_states.iter().map(|s| (s, false)));
+                for (s, initial) in marks {
+                    let sid = m.thing(id).unwrap().states.iter().find(|x| x.name.eq_ignore_ascii_case(s.trim())).map(|x| x.id);
+                    let sid = sid.ok_or_else(|| format!("'{}' has no state '{s}'", t.name))?;
+                    let (i, f) = if initial { (Some(true), None) } else { (None, Some(true)) };
+                    m.apply(Op::SetState { id: sid, initial: i, final_: f })?;
+                }
             }
             auto_arrange(m, &touched)?;
             Ok(summary(&p.model, m))
@@ -307,7 +368,11 @@ impl Mcp {
                     from_state: state_id(m, from, to, &l.from_state)?,
                     to_state: state_id(m, from, to, &l.to_state)?,
                 };
-                m.apply(op).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
+                let id = m.apply(op).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
+                if l.modifier.is_some() || l.multiplicity.is_some() {
+                    let op = Op::SetLink { id, states: None, modifier: modifier(&l.modifier)?, multiplicity: l.multiplicity.clone() };
+                    m.apply(op).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
+                }
                 // A thing linked to what's inside an in-zoomed process joins that diagram (outside it).
                 for (opd, inner) in m.opds.iter().filter(|o| !o.unfold && o.refines.is_some()).map(|o| (o.id, m.inner(o.id))).collect::<Vec<_>>() {
                     for (a, b) in [(from, to), (to, from)] {
@@ -318,6 +383,21 @@ impl Mcp {
                 }
             }
             auto_arrange(m, &touched)?;
+            Ok(summary(&p.model, m))
+        })
+    }
+
+    #[tool(description = "Group existing links of one kind that share an end as alternatives: xor = exactly one happens ('Brewing yields either Espresso or Lungo'), or = at least one; none ungroups.")]
+    async fn fan(&self, Parameters(p): Parameters<FanLinks>) -> Result<String, String> {
+        self.app.edit(&p.model, "AI", |m| {
+            let kind = match p.kind.trim().to_lowercase().as_str() {
+                "xor" => Some(FanKind::Xor),
+                "or" => Some(FanKind::Or),
+                "none" | "" => None,
+                other => return Err(format!("kind must be xor, or, or none; got '{other}'")),
+            };
+            let links = p.links.iter().map(|l| find_link(m, &l.from, &l.to, &l.kind)).collect::<Result<Vec<_>, _>>()?;
+            m.apply(Op::Fan { links, kind })?;
             Ok(summary(&p.model, m))
         })
     }

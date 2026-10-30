@@ -38,6 +38,12 @@ pub enum Affiliation {
 pub struct State {
     pub id: Id,
     pub name: String,
+    /// The state the object starts in (drawn with a thick border).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub initial: bool,
+    /// A state the object ends in (drawn with a double border).
+    #[serde(default, rename = "final", skip_serializing_if = "std::ops::Not::not")]
+    pub final_: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,6 +129,23 @@ impl LinkKind {
     }
 }
 
+/// Control modifier of an enabling or transforming link (ISO 19450 "c" and "e" links).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Modifier {
+    #[default]
+    None,
+    /// The process happens only if the object exists (in that state); otherwise it is skipped.
+    Condition,
+    /// The object appearing (in that state) starts the process.
+    Event,
+}
+
+impl Modifier {
+    pub fn is_none(&self) -> bool {
+        *self == Modifier::None
+    }
+}
+
 /// `from_state` / `to_state` always refer to states of the object end of the link:
 /// input state and output state (Effect uses both: "changes X from a to b").
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -135,6 +158,51 @@ pub struct Link {
     pub from_state: Option<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_state: Option<Id>,
+    #[serde(default, skip_serializing_if = "Modifier::is_none")]
+    pub modifier: Modifier,
+    /// How many of the object/part end: "4", "0..1", "1..*", "2..5", "*". Empty = one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub multiplicity: String,
+}
+
+impl Link {
+    /// Can carry a condition or event: agent, instrument, consumption or effect between an object and a process.
+    pub fn modifiable(&self) -> bool {
+        use LinkKind::*;
+        matches!(self.kind, Agent | Instrument | Consumption | Effect)
+    }
+
+    /// Can carry a multiplicity: all but generalization, classification and invocation.
+    pub fn countable(&self) -> bool {
+        use LinkKind::*;
+        !matches!(self.kind, Generalization | Classification | Invocation)
+    }
+}
+
+/// "4", "0..1", "1..*", "2..5", "*".
+pub fn valid_multiplicity(s: &str) -> bool {
+    let num = |x: &str| !x.is_empty() && x.chars().all(|c| c.is_ascii_digit());
+    match s.split_once("..") {
+        None => s == "*" || num(s),
+        Some((a, "*")) => num(a),
+        Some((a, b)) => num(a) && num(b) && a.parse::<u64>().ok() <= b.parse::<u64>().ok(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FanKind {
+    /// Exactly one of the links happens.
+    Xor,
+    /// At least one of them happens.
+    Or,
+}
+
+/// Links of the same kind sharing one end, grouped as alternatives ("yields either A or B").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Fan {
+    pub id: Id,
+    pub kind: FanKind,
+    pub links: Vec<Id>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -145,6 +213,8 @@ pub struct Model {
     /// The diagram tree; the first one is the root (SD).
     #[serde(default)]
     pub opds: Vec<Opd>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fans: Vec<Fan>,
     pub next_id: Id,
 }
 
@@ -223,6 +293,30 @@ pub enum Op {
         #[serde(default)]
         affiliation: Option<Affiliation>,
     },
+    /// Link details: the object's input/output states, condition/event, multiplicity ("" clears it).
+    SetLink {
+        id: Id,
+        #[serde(default)]
+        states: Option<(Option<Id>, Option<Id>)>,
+        #[serde(default)]
+        modifier: Option<Modifier>,
+        #[serde(default)]
+        multiplicity: Option<String>,
+    },
+    SetState {
+        id: Id,
+        #[serde(default)]
+        initial: Option<bool>,
+        #[serde(default, rename = "final")]
+        final_: Option<bool>,
+    },
+    /// Groups links (same kind, one shared end) as XOR/OR alternatives; `kind: None` ungroups them.
+    /// Returns the fan id (or the first link's id when ungrouping).
+    Fan {
+        links: Vec<Id>,
+        #[serde(default)]
+        kind: Option<FanKind>,
+    },
     /// Thing (from the whole model, with its links and detail diagrams), state, or link.
     Remove { id: Id },
     /// Paste into `opd`: things (with states) and the links among them, carrying any ids, placed at
@@ -272,7 +366,7 @@ impl Model {
     /// diagram showing everything where it was.
     pub fn normalize(&mut self) {
         let max = self.things.iter().flat_map(|t| std::iter::once(t.id).chain(t.states.iter().map(|s| s.id)));
-        let max = max.chain(self.links.iter().map(|l| l.id)).chain(self.opds.iter().map(|o| o.id)).max().unwrap_or(0);
+        let max = max.chain(self.links.iter().map(|l| l.id)).chain(self.opds.iter().map(|o| o.id)).chain(self.fans.iter().map(|f| f.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(max + 1);
         if self.opds.is_empty() {
             let shows = self.things.iter().map(|t| Shown { thing: t.id, x: t.x, y: t.y, auto: t.auto, inside: false }).collect();
@@ -285,7 +379,7 @@ impl Model {
     pub fn validate(&self) -> Result<(), String> {
         let mut seen = HashSet::new();
         let ids = self.things.iter().flat_map(|t| std::iter::once(t.id).chain(t.states.iter().map(|s| s.id)));
-        for id in ids.chain(self.links.iter().map(|l| l.id)).chain(self.opds.iter().map(|o| o.id)) {
+        for id in ids.chain(self.links.iter().map(|l| l.id)).chain(self.opds.iter().map(|o| o.id)).chain(self.fans.iter().map(|f| f.id)) {
             if id == 0 || id >= self.next_id || !seen.insert(id) {
                 return Err(format!("bad or duplicate id {id}"));
             }
@@ -297,6 +391,9 @@ impl Model {
             if [l.from_state, l.to_state].into_iter().flatten().any(|s| self.state(s).is_none()) {
                 return Err(format!("link {} points to a missing state", l.id));
             }
+        }
+        if self.fans.iter().any(|f| f.links.iter().any(|l| !self.links.iter().any(|x| x.id == *l))) {
+            return Err("a fan points to a missing link".into());
         }
         if self.opds.iter().filter(|o| o.parent.is_none()).count() != 1 || self.opds.first().is_some_and(|o| o.parent.is_some()) {
             return Err("there must be exactly one root diagram, listed first".into());
@@ -379,7 +476,7 @@ impl Model {
     /// Diagrams and ids stay, so ops can be tried on the result.
     pub fn view(&self, opd: Id) -> Model {
         let opd = if self.opd(opd).is_some() { opd } else { self.root() };
-        let mut v = Model { name: self.name.clone(), things: vec![], links: vec![], opds: self.opds.clone(), next_id: self.next_id };
+        let mut v = Model { name: self.name.clone(), opds: self.opds.clone(), next_id: self.next_id, ..Default::default() };
         let Some(o) = self.opd(opd) else { return v };
         let zoomed = o.refines.filter(|_| !o.unfold);
         for s in &o.shows {
@@ -412,7 +509,30 @@ impl Model {
             })
             .cloned()
             .collect();
+        v.fans = self.fans.clone();
+        v.prune_fans();
         v
+    }
+
+    /// Drops links that are gone from fans, and fans left with fewer than two links.
+    fn prune_fans(&mut self) {
+        let links: HashSet<Id> = self.links.iter().map(|l| l.id).collect();
+        for f in &mut self.fans {
+            f.links.retain(|l| links.contains(l));
+        }
+        self.fans.retain(|f| f.links.len() >= 2);
+    }
+
+    /// The fan grouping link `id`, if any.
+    pub fn fan_of(&self, id: Id) -> Option<&Fan> {
+        self.fans.iter().find(|f| f.links.contains(&id))
+    }
+
+    /// The end every link of a fan shares.
+    pub fn fan_end(&self, f: &Fan) -> Option<Id> {
+        let ls: Vec<&Link> = f.links.iter().filter_map(|id| self.links.iter().find(|l| l.id == *id)).collect();
+        let first = ls.first()?;
+        [first.from, first.to].into_iter().find(|&e| ls.iter().all(|l| l.from == e || l.to == e))
     }
 
     /// In a diagram view: sizes the in-zoomed frame around what is inside it (after things moved).
@@ -444,6 +564,7 @@ impl Model {
                 break;
             }
         }
+        self.prune_fans();
     }
 
     /// A free-ish spot for a thing added without a position (automatic arranging tidies it afterwards).
@@ -598,7 +719,7 @@ impl Model {
                     return Err(format!("invalid or duplicate state '{name}'"));
                 }
                 let id = self.fresh();
-                self.things.iter_mut().find(|t| t.id == thing).unwrap().states.push(State { id, name });
+                self.things.iter_mut().find(|t| t.id == thing).unwrap().states.push(State { id, name, initial: false, final_: false });
                 Ok(id)
             }
             Op::AddLink { from, to, kind, from_state, to_state } => {
@@ -630,7 +751,7 @@ impl Model {
                     return Err("link already exists".into());
                 }
                 let id = self.fresh();
-                self.links.push(Link { id, from, to, kind, from_state, to_state });
+                self.links.push(Link { id, from, to, kind, from_state, to_state, modifier: Modifier::None, multiplicity: String::new() });
                 Ok(id)
             }
             Op::Rename { id, name } => {
@@ -668,6 +789,76 @@ impl Model {
                 }
                 Ok(id)
             }
+            Op::SetLink { id, states, modifier, multiplicity } => {
+                let l = self.links.iter().find(|l| l.id == id).ok_or("no such link")?.clone();
+                if let Some((a, b)) = states {
+                    let (f, t) = (self.thing(l.from).ok_or("no such thing")?, self.thing(l.to).ok_or("no such thing")?);
+                    let obj = match (f.kind, t.kind) {
+                        (Kind::Object, Kind::Process) => f,
+                        (Kind::Process, Kind::Object) => t,
+                        _ => return Err("states only apply to links between an object and a process".into()),
+                    };
+                    if [a, b].into_iter().flatten().any(|s| !obj.states.iter().any(|x| x.id == s)) {
+                        return Err(format!("that state does not belong to '{}'", obj.name));
+                    }
+                }
+                if modifier.is_some_and(|m| !m.is_none()) && !l.modifiable() {
+                    return Err("only agent, instrument, consumption and effect links can be conditions or events".into());
+                }
+                let multiplicity = multiplicity.map(|m| m.trim().replace(' ', ""));
+                if let Some(m) = multiplicity.as_deref().filter(|m| !m.is_empty()) {
+                    if !l.countable() {
+                        return Err(format!("{:?} links have no multiplicity", l.kind));
+                    }
+                    if !valid_multiplicity(m) {
+                        return Err(format!("multiplicity '{m}' should look like 4, 0..1, 1..*, 2..5 or *"));
+                    }
+                }
+                let l = self.links.iter_mut().find(|l| l.id == id).unwrap();
+                if let Some((a, b)) = states {
+                    (l.from_state, l.to_state) = (a, b);
+                }
+                if let Some(m) = modifier {
+                    l.modifier = m;
+                }
+                if let Some(m) = multiplicity {
+                    l.multiplicity = m;
+                }
+                Ok(id)
+            }
+            Op::SetState { id, initial, final_ } => {
+                let s = self.things.iter_mut().flat_map(|t| t.states.iter_mut()).find(|s| s.id == id).ok_or("no such state")?;
+                if let Some(v) = initial {
+                    s.initial = v;
+                }
+                if let Some(v) = final_ {
+                    s.final_ = v;
+                }
+                Ok(id)
+            }
+            Op::Fan { links, kind } => {
+                let mut links = links;
+                links.dedup();
+                for f in &mut self.fans {
+                    f.links.retain(|l| !links.contains(l));
+                }
+                self.prune_fans();
+                let Some(kind) = kind else { return links.first().copied().ok_or_else(|| "no links".into()) };
+                let ls: Vec<&Link> = links.iter().map(|id| self.links.iter().find(|l| l.id == *id).ok_or("no such link")).collect::<Result<_, _>>()?;
+                if ls.len() < 2 {
+                    return Err("a fan needs two or more links".into());
+                }
+                if !ls.iter().all(|l| l.kind.is_procedural() && l.kind == ls[0].kind) {
+                    return Err("a fan groups procedural links of one kind (e.g. all results)".into());
+                }
+                let fan = Fan { id: 0, kind, links: links.clone() };
+                if self.fan_end(&fan).is_none() {
+                    return Err("the links of a fan must share one end".into());
+                }
+                let id = self.fresh();
+                self.fans.push(Fan { id, ..fan });
+                Ok(id)
+            }
             Op::Remove { id } => {
                 if let Some(i) = self.things.iter().position(|t| t.id == id) {
                     self.things.remove(i);
@@ -675,6 +866,7 @@ impl Model {
                     self.cleanup();
                 } else if let Some(i) = self.links.iter().position(|l| l.id == id) {
                     self.links.remove(i);
+                    self.prune_fans();
                 } else if self.state(id).is_some() {
                     for t in &mut self.things {
                         t.states.retain(|s| s.id != id);
@@ -714,13 +906,15 @@ impl Model {
                     map.insert(t.id, id);
                     for s in t.states {
                         let sid = self.apply(Op::AddState { thing: id, name: s.name })?;
+                        self.apply(Op::SetState { id: sid, initial: Some(s.initial), final_: Some(s.final_) })?;
                         map.insert(s.id, sid);
                     }
                 }
                 for l in links {
                     let (Some(&from), Some(&to)) = (map.get(&l.from), map.get(&l.to)) else { continue };
                     let st = |s: Option<Id>| s.and_then(|s| map.get(&s).copied());
-                    self.apply(Op::AddLink { from, to, kind: l.kind, from_state: st(l.from_state), to_state: st(l.to_state) })?;
+                    let id = self.apply(Op::AddLink { from, to, kind: l.kind, from_state: st(l.from_state), to_state: st(l.to_state) })?;
+                    self.apply(Op::SetLink { id, states: None, modifier: Some(l.modifier), multiplicity: Some(l.multiplicity) })?;
                 }
                 first.ok_or_else(|| "nothing to insert".into())
             }

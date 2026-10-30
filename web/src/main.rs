@@ -4,7 +4,7 @@ use gloo_net::{http::Request, websocket::{futures::WebSocket, Message}};
 use gloo_timers::future::TimeoutFuture;
 use leptos::{ev, prelude::*, task::spawn_local};
 use canvas::{kind_label, Canvas};
-use opm_core::{layout::size, opl, Affiliation, Essence, Id, Kind, Model, Op};
+use opm_core::{layout::size, opl, Affiliation, Essence, FanKind, Id, Kind, Model, Modifier, Op};
 
 mod canvas;
 mod files;
@@ -112,6 +112,8 @@ pub struct Ui {
     toast: RwSignal<Option<String>>,
     live: RwSignal<bool>,
     chatgpt: RwSignal<bool>,
+    /// The Ctrl+K finder is open.
+    search: RwSignal<bool>,
     past: StoredValue<Vec<Model>>,
     future: StoredValue<Vec<Model>>,
     fitted: StoredValue<bool>,
@@ -381,6 +383,31 @@ impl Ui {
         }
     }
 
+    /// Opens diagram `opd`, selects `id` there and centers it, with a short glow.
+    pub fn focus(self, opd: Id, id: Id) {
+        if self.here() != opd {
+            self.go(opd);
+        }
+        spawn_local(async move {
+            // The diagram arrives through the hash change; wait for it.
+            for _ in 0..80 {
+                if self.showing.get_value() == opd && self.model.with_untracked(|m| m.as_ref().is_some_and(|m| m.thing(id).is_some())) {
+                    break;
+                }
+                TimeoutFuture::new(25).await;
+            }
+            let Some(t) = self.model.with_untracked(|m| m.as_ref().and_then(|m| m.thing(id).cloned())) else { return };
+            let Some(r) = self.svg_rect() else { return };
+            let (w, h) = size(&t);
+            let z = self.view.get_untracked().2.max(0.8);
+            self.view.set((r.width() / 2.0 - (t.x + w / 2.0) * z, r.height() / 2.0 - (t.y + h / 2.0) * z, z));
+            self.select(Some(Sel::Thing(id)));
+            self.fresh.update(|f| f.push(id));
+            TimeoutFuture::new(1600).await;
+            self.fresh.update(|f| f.retain(|x| *x != id));
+        });
+    }
+
     fn zoom_by(self, f: f64, around: P) {
         let (px, py, z) = self.view.get_untracked();
         let nz = (z * f).clamp(0.2, 3.0);
@@ -534,6 +561,10 @@ fn Inspector() -> impl IntoView {
                         <section class="inspector">
                             <div class="eyebrow"><span class="dot state"></span>"State of " {t.name.clone()}</div>
                             <input class="title-input" prop:value=s.name.clone() on:change=move |e| ui.rename(sid, event_target_value(&e)) />
+                            <div class="seg">
+                                <button class:on=s.initial title="The state it starts in" on:click={let v = !s.initial; move |_| ui.send(vec![Op::SetState { id: sid, initial: Some(v), final_: None }], |_| {})}>"Initial"</button>
+                                <button class:on=s.final_ title="A state it ends in" on:click={let v = !s.final_; move |_| ui.send(vec![Op::SetState { id: sid, initial: None, final_: Some(v) }], |_| {})}>"Final"</button>
+                            </div>
                             <p class="muted small">"Drag from a state to a process to make the link state-specific."</p>
                             <button class="danger" on:click=move |_| ui.remove_selected()>"Delete state"</button>
                         </section>
@@ -560,16 +591,10 @@ fn Inspector() -> impl IntoView {
                             v
                         };
                         let relink = move |from_state: Option<Option<Id>>, to_state: Option<Option<Id>>| {
-                            let l = l.clone();
-                            ui.send(
-                                vec![
-                                    Op::Remove { id: l.id },
-                                    Op::AddLink { from: l.from, to: l.to, kind: l.kind.clone(), from_state: from_state.unwrap_or(l.from_state), to_state: to_state.unwrap_or(l.to_state) },
-                                ],
-                                move |ids| if let Some(&id) = ids.get(1) { ui.select(Some(Sel::Link(id))) },
-                            );
+                            let states = Some((from_state.unwrap_or(cur_in), to_state.unwrap_or(cur_out)));
+                            ui.send(vec![Op::SetLink { id: lid, states, modifier: None, multiplicity: None }], |_| {});
                         };
-                        let relink2 = relink.clone();
+                        let relink2 = relink;
                         let parse = |v: String| v.parse::<Id>().ok();
                         view! {
                             <label class="label">"Input state"</label>
@@ -578,17 +603,200 @@ fn Inspector() -> impl IntoView {
                             <select on:change=move |e| relink2(None, Some(parse(event_target_value(&e))))>{opts(cur_out)}</select>
                         }
                     });
+                    let set = move |modifier: Option<Modifier>, multiplicity: Option<String>| {
+                        ui.send(vec![Op::SetLink { id: lid, states: None, modifier, multiplicity }], |_| {});
+                    };
+                    let between = f.kind != t.kind;
+                    let modifier = (l.modifiable() && between).then(|| {
+                        let cur = l.modifier;
+                        let opt = move |m: Modifier, text: &'static str, tip: &'static str| view! {
+                            <button class:on=cur == m title=tip on:click=move |_| set(Some(m), None)>{text}</button>
+                        };
+                        view! {
+                            <div class="label">"Trigger"</div>
+                            <div class="seg">
+                                {opt(Modifier::None, "Normal", "Always part of the process")}
+                                {opt(Modifier::Condition, "Condition (c)", "The process runs only if this object exists (in that state); otherwise it is skipped")}
+                                {opt(Modifier::Event, "Event (e)", "This object appearing (in that state) starts the process")}
+                            </div>
+                        }
+                    });
+                    let count = l.countable().then(|| view! {
+                        <label class="label">"Multiplicity"</label>
+                        <input
+                            class="field-input"
+                            placeholder="1   (e.g. 4, 0..1, 1..*, 2..5)"
+                            prop:value=l.multiplicity.clone()
+                            on:change=move |e| set(None, Some(event_target_value(&e)))
+                        />
+                    });
+                    // XOR/OR: this link and its siblings (same kind, same shared end) as alternatives.
+                    let fan = m.fan_of(lid).cloned();
+                    let siblings = |end: Id, at_from: bool| -> Vec<Id> {
+                        m.links
+                            .iter()
+                            .filter(|o| o.kind == l.kind && (if at_from { o.from == end } else { o.to == end }))
+                            .map(|o| o.id)
+                            .collect()
+                    };
+                    let (a, b) = (siblings(l.from, true), siblings(l.to, false));
+                    let process_end_is_to = t.kind == Kind::Process;
+                    let members = match &fan {
+                        Some(fan) => fan.links.clone(),
+                        None if a.len() > b.len() || (a.len() == b.len() && !process_end_is_to) => a,
+                        None => b,
+                    };
+                    let alternatives = (l.kind.is_procedural() && members.len() >= 2).then(|| {
+                        let others: Vec<String> = members
+                            .iter()
+                            .filter(|&&id| id != lid)
+                            .filter_map(|id| m.links.iter().find(|o| o.id == *id))
+                            .filter_map(|o| m.thing(if o.from == l.from { o.to } else { o.from }).map(|t| t.name.clone()))
+                            .collect();
+                        let cur = fan.as_ref().map(|f| f.kind);
+                        let members2 = members.clone();
+                        let pick = move |k: Option<FanKind>| {
+                            let members = members2.clone();
+                            move |_| ui.send(vec![Op::Fan { links: members.clone(), kind: k }], |_| {})
+                        };
+                        view! {
+                            <div class="label">"Alternatives with " {others.join(", ")}</div>
+                            <div class="seg">
+                                <button class:on=cur.is_none() on:click=pick(None)>"All"</button>
+                                <button class:on=cur == Some(FanKind::Xor) title="Exactly one of them" on:click=pick(Some(FanKind::Xor))>"Either (XOR)"</button>
+                                <button class:on=cur == Some(FanKind::Or) title="At least one of them" on:click=pick(Some(FanKind::Or))>"Or (OR)"</button>
+                            </div>
+                        }
+                    });
                     view! {
                         <section class="inspector">
                             <div class="eyebrow"><span class="dot link"></span>{label} " link"</div>
                             <p class="sentence">{sentence}</p>
                             {pickers}
+                            {modifier}
+                            {count}
+                            {alternatives}
                             <button class="danger" on:click=move |_| ui.remove_selected()>"Delete link"</button>
                         </section>
                     }
                     .into_any()
                 }
             })
+        })
+    }
+}
+
+/// Ctrl+K: find any thing, state or diagram in the whole model and jump to it.
+#[component]
+fn Search() -> impl IntoView {
+    let ui = ui();
+    let query = RwSignal::new(String::new());
+    let active = RwSignal::new(0usize);
+    let input: NodeRef<leptos::html::Input> = NodeRef::new();
+    Effect::new(move |_| {
+        if ui.search.get() {
+            spawn_local(async move {
+                TimeoutFuture::new(0).await;
+                if let Some(el) = input.get_untracked() {
+                    let _ = el.focus();
+                }
+            });
+        }
+    });
+    // (label, detail, diagram, thing to focus)
+    let results = Memo::new(move |_| {
+        let q = query.get().trim().to_lowercase();
+        ui.full.with(|f| {
+            let Some(f) = f.as_ref() else { return vec![] };
+            let here = ui.here();
+            let mut out: Vec<(u8, String, String, Id, Option<Id>)> = vec![];
+            let rank = |name: &str| {
+                let n = name.to_lowercase();
+                if q.is_empty() || n.starts_with(&q) { Some(0) } else if n.contains(&q) { Some(1) } else { None }
+            };
+            for t in &f.things {
+                let shown = f.shown_in(t.id);
+                // Prefer the diagram on screen, else where it was first drawn.
+                let Some(&opd) = shown.iter().find(|&&o| o == here).or(shown.first()) else { continue };
+                let labels: Vec<String> = shown.iter().map(|&o| f.label(o)).collect();
+                let kind = if t.kind == Kind::Object { "Object" } else { "Process" };
+                if let Some(r) = rank(&t.name) {
+                    out.push((r, t.name.clone(), format!("{kind} · {}", labels.join(", ")), opd, Some(t.id)));
+                }
+                for st in &t.states {
+                    if let Some(r) = rank(&st.name).filter(|_| !q.is_empty()) {
+                        out.push((r + 1, st.name.clone(), format!("State of {} · {}", t.name, labels.join(", ")), opd, Some(t.id)));
+                    }
+                }
+            }
+            for (o, _) in f.tree() {
+                if let Some(r) = rank(&f.title(o)).or_else(|| rank(&f.label(o))) {
+                    out.push((r, f.title(o), "Diagram".into(), o, None));
+                }
+            }
+            out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+            out.truncate(40);
+            out.into_iter().map(|(_, a, b, c, d)| (a, b, c, d)).collect::<Vec<_>>()
+        })
+    });
+    let close = move || {
+        ui.search.set(false);
+        query.set(String::new());
+        active.set(0);
+    };
+    let choose = move |i: usize| {
+        let Some((_, _, opd, thing)) = results.with_untracked(|r| r.get(i).cloned()) else { return };
+        close();
+        match thing {
+            Some(id) => ui.focus(opd, id),
+            None => ui.go(opd),
+        }
+    };
+    let key = move |e: ev::KeyboardEvent| {
+        let n = results.with_untracked(|r| r.len());
+        match e.key().as_str() {
+            "ArrowDown" if n > 0 => active.update(|a| *a = (*a + 1) % n),
+            "ArrowUp" if n > 0 => active.update(|a| *a = (*a + n - 1) % n),
+            "Enter" => choose(active.get_untracked()),
+            "Escape" => close(),
+            _ => return,
+        }
+        e.prevent_default();
+    };
+    move || {
+        ui.search.get().then(|| view! {
+            <div class="backdrop top" on:click=move |_| close()>
+                <div class="modal finder" on:click=|e| e.stop_propagation()>
+                    <input
+                        node_ref=input
+                        class="finder-input"
+                        placeholder="Find a thing, state or diagram…"
+                        autofocus
+                        prop:value=query
+                        on:input=move |e| { query.set(event_target_value(&e)); active.set(0); }
+                        on:keydown=key
+                    />
+                    <div class="finder-list">
+                        {move || {
+                            let rows = results.get();
+                            if rows.is_empty() {
+                                return view! { <p class="muted small">"Nothing found."</p> }.into_any();
+                            }
+                            rows.into_iter().enumerate().map(|(i, (name, detail, _, _))| view! {
+                                <button
+                                    class="finder-row"
+                                    class:on=move || active.get() == i
+                                    on:mouseenter=move |_| active.set(i)
+                                    on:click=move |_| choose(i)
+                                >
+                                    <span>{name}</span>
+                                    <span class="muted small">{detail}</span>
+                                </button>
+                            }).collect_view().into_any()
+                        }}
+                    </div>
+                </div>
+            </div>
         })
     }
 }
@@ -1111,6 +1319,7 @@ fn App() -> impl IntoView {
         toast: RwSignal::new(None),
         live: RwSignal::new(false),
         chatgpt: RwSignal::new(false),
+        search: RwSignal::new(false),
         past: StoredValue::new(vec![]),
         future: StoredValue::new(vec![]),
         fitted: StoredValue::new(false),
@@ -1141,7 +1350,13 @@ fn App() -> impl IntoView {
         opd
     });
     ui.import_on_drop();
-    let _ = window_event_listener(ev::keydown, move |e| ui.key(e));
+    let _ = window_event_listener(ev::keydown, move |e| {
+        if (e.ctrl_key() || e.meta_key()) && e.key().eq_ignore_ascii_case("k") && ui.mid.get_untracked().is_some() {
+            e.prevent_default();
+            return ui.search.set(true);
+        }
+        ui.key(e)
+    });
     // Clipboard: copy/cut/paste things (also across models and tabs), unless a text field has focus.
     let typing = || {
         document()
@@ -1216,6 +1431,7 @@ fn App() -> impl IntoView {
                         <option value="">"+ New model…"</option>
                     </select>
                     <ModelMenu />
+                    <button class="ghost-btn" title="Find anything in the model (Ctrl+K)" on:click=move |_| ui.search.set(true)>"Find  " <kbd>"Ctrl K"</kbd></button>
                     <span class=move || if ui.live.get() { "live on" } else { "live" } title="Live sync with server">
                         {move || if ui.live.get() { "Live" } else { "Offline" }}
                     </span>
@@ -1248,6 +1464,7 @@ fn App() -> impl IntoView {
                 .into_any(),
             }}
             <ChatGptModal />
+            <Search />
             {move || ui.toast.get().map(|t| view! { <div class="toast">{t}</div> })}
         </div>
     }

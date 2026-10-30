@@ -1,5 +1,5 @@
 //! Object-Process Language: the English sentences equivalent to the diagram.
-use crate::{Affiliation, Essence, Id, Kind, LinkKind, Model, Thing};
+use crate::{Affiliation, Essence, FanKind, Id, Kind, Link, LinkKind, Modifier, Model, Thing};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -24,6 +24,40 @@ fn article(word: &str) -> &'static str {
         Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
         _ => "a",
     }
+}
+
+/// "Wheel" -> "Wheels", "Battery" -> "Batteries", "Box" -> "Boxes" (last word only).
+fn plural(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let consonant_y = lower.ends_with('y') && !lower.ends_with("ay") && !lower.ends_with("ey") && !lower.ends_with("oy") && !lower.ends_with("uy");
+    if consonant_y {
+        format!("{}ies", &name[..name.len() - 1])
+    } else if ["s", "x", "z", "ch", "sh"].iter().any(|e| lower.ends_with(e)) {
+        format!("{name}es")
+    } else {
+        format!("{name}s")
+    }
+}
+
+/// "4 Wheels", "an optional Spoiler", "at least one hot Cup", "2 to 5 Seats".
+fn counted(multiplicity: &str, state: Option<String>, name: &str) -> String {
+    let (prefix, many) = match multiplicity.split_once("..") {
+        _ if multiplicity.is_empty() || multiplicity == "1" => (String::new(), false),
+        None if multiplicity == "*" => ("any number of".into(), true),
+        None => (multiplicity.to_string(), true),
+        Some(("0", "1")) => ("an optional".into(), false),
+        Some(("1", "*")) => ("at least one".into(), false),
+        Some(("0", "*")) => ("any number of".into(), true),
+        Some((a, "*")) => (format!("at least {a}"), true),
+        Some((a, b)) => (format!("{a} to {b}"), true),
+    };
+    let noun = if many { plural(name) } else { name.to_string() };
+    [prefix, state.unwrap_or_default(), noun].into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// Sentences for one diagram view (see `Model::view`), or for a whole model given directly.
@@ -63,19 +97,64 @@ pub fn render(m: &Model) -> Vec<Sentence> {
         if !traits.is_empty() {
             out.push(Sentence { text: format!("{} is {}.", t.name, list(&traits, "and")), refs: vec![t.id] });
         }
-        match t.states.as_slice() {
-            [] => {}
-            [s] => out.push(Sentence { text: format!("{} is {}.", t.name, s.name), refs: vec![t.id] }),
-            ss => {
+        // An attribute with one state is a value: "Weight of Car is heavy."
+        let owner = m.links.iter().find(|l| l.to == t.id && l.kind == LinkKind::Exhibition).map(|l| name(l.from));
+        match (t.states.as_slice(), owner) {
+            ([], _) => {}
+            ([s], Some(o)) => out.push(Sentence { text: format!("{} of {o} is {}.", t.name, s.name), refs: vec![t.id] }),
+            ([s], None) => out.push(Sentence { text: format!("{} is {}.", t.name, s.name), refs: vec![t.id] }),
+            (ss, _) => {
                 let names: Vec<_> = ss.iter().map(|s| s.name.clone()).collect();
                 out.push(Sentence { text: format!("{} can be {}.", t.name, list(&names, "or")), refs: vec![t.id] });
             }
         }
+        for s in &t.states {
+            let what = match (s.initial, s.final_) {
+                (true, true) => "initial and final",
+                (true, false) => "initial",
+                (false, true) => "final",
+                _ => continue,
+            };
+            out.push(Sentence { text: format!("State {} of {} is {what}.", s.name, t.name), refs: vec![t.id] });
+        }
+    }
+
+    // XOR/OR fans: "Brewing yields either Espresso or Lungo."
+    for f in &m.fans {
+        let Some(end) = m.fan_end(f) else { continue };
+        let ls: Vec<&Link> = f.links.iter().filter_map(|id| m.links.iter().find(|l| l.id == *id)).collect();
+        let Some(kind) = ls.first().map(|l| l.kind.clone()) else { continue };
+        let members: Vec<String> = ls
+            .iter()
+            .map(|l| {
+                let other = if l.from == end { l.to } else { l.from };
+                let st = if kind == LinkKind::Result { l.to_state } else { l.from_state };
+                let is_obj = m.thing(other).is_some_and(|t| t.kind == Kind::Object);
+                if is_obj { counted(&l.multiplicity, state(st), &name(other)) } else { name(other) }
+            })
+            .collect();
+        let alts = match f.kind {
+            FanKind::Xor => format!("either {}", list(&members, "or")),
+            FanKind::Or => format!("at least one of {}", list(&members, "or")),
+        };
+        let c = name(end);
+        let end_is_process = m.thing(end).is_some_and(|t| t.kind == Kind::Process);
+        let text = match (&kind, end_is_process) {
+            (LinkKind::Invocation, _) if ls[0].from == end => format!("{c} invokes {alts}."),
+            (LinkKind::Invocation, _) => format!("{} invokes {c}.", capitalize(&alts)),
+            (LinkKind::Agent, true) => format!("{} handles {c}.", capitalize(&alts)),
+            (LinkKind::Agent, false) => format!("{c} handles {alts}."),
+            (k, true) => format!("{c} {} {alts}.", verb(k)),
+            (k, false) => format!("{} {} {c}.", capitalize(&alts), verb(k)),
+        };
+        let mut refs = vec![end];
+        refs.extend(ls.iter().flat_map(|l| [l.id, l.from, l.to]));
+        out.push(Sentence { text, refs });
     }
 
     // Aggregation and exhibition are grouped per whole: "Car consists of Engine and Wheels."
     let mut grouped: Vec<(Id, bool)> = vec![];
-    for l in &m.links {
+    for l in m.links.iter().filter(|l| m.fan_of(l.id).is_none()) {
         let group = match l.kind {
             LinkKind::Aggregation => Some(true),
             LinkKind::Exhibition => Some(false),
@@ -91,7 +170,7 @@ pub fn render(m: &Model) -> Vec<Sentence> {
                 .iter()
                 .filter(|o| o.from == l.from && o.kind == l.kind)
                 .collect();
-            let parts: Vec<_> = same.iter().map(|o| name(o.to)).collect();
+            let parts: Vec<_> = same.iter().map(|o| counted(&o.multiplicity, None, &name(o.to))).collect();
             let verb = if is_agg { "consists of" } else { "exhibits" };
             let mut refs = vec![l.from];
             refs.extend(same.iter().flat_map(|o| [o.id, o.to]));
@@ -103,28 +182,52 @@ pub fn render(m: &Model) -> Vec<Sentence> {
         let process_first = m.thing(l.from).is_some_and(|x| x.kind == Kind::Process);
         // For procedural links between an object and a process, the process is the subject.
         let (p, o) = if process_first { (f.clone(), t.clone()) } else { (t.clone(), f.clone()) };
-        let qualified = |s: Option<String>| s.map(|s| format!("{s} {o}")).unwrap_or_else(|| o.clone());
-        let text = match &l.kind {
-            LinkKind::Generalization => format!("{t} is {} {f}.", article(&f)),
-            LinkKind::Classification => format!("{t} is an instance of {f}."),
-            LinkKind::Tagged(tag) if tag.is_empty() => format!("{f} relates to {t}."),
-            LinkKind::Tagged(tag) => format!("{f} {tag} {t}."),
-            LinkKind::Agent => format!("{o} handles {p}."),
-            LinkKind::Instrument => format!("{p} requires {}.", qualified(state(l.from_state))),
-            LinkKind::Consumption => format!("{p} consumes {}.", qualified(state(l.from_state))),
-            LinkKind::Result => format!("{p} yields {}.", qualified(state(l.to_state))),
-            LinkKind::Effect => match (state(l.from_state), state(l.to_state)) {
-                (None, None) => format!("{p} affects {o}."),
-                (Some(a), Some(b)) => format!("{p} changes {o} from {a} to {b}."),
-                (Some(a), None) => format!("{p} changes {o} from {a}."),
-                (None, Some(b)) => format!("{p} changes {o} to {b}."),
+        let input = state(l.from_state);
+        let obj = |s: Option<String>| counted(&l.multiplicity, s, &o);
+        // What the process does to the object: "consumes 2 cold Eggs".
+        let pred = match &l.kind {
+            LinkKind::Instrument => format!("requires {}", obj(input.clone())),
+            LinkKind::Consumption => format!("consumes {}", obj(input.clone())),
+            LinkKind::Result => format!("yields {}", obj(state(l.to_state))),
+            LinkKind::Effect => match (input.clone(), state(l.to_state)) {
+                (None, None) => format!("affects {}", obj(None)),
+                (Some(a), Some(b)) => format!("changes {o} from {a} to {b}"),
+                (Some(a), None) => format!("changes {o} from {a}"),
+                (None, Some(b)) => format!("changes {o} to {b}"),
             },
-            LinkKind::Invocation => format!("{f} invokes {t}."),
-            LinkKind::Aggregation | LinkKind::Exhibition => unreachable!(),
+            _ => String::new(),
+        };
+        // Condition: "Boiling occurs if Water is cold, otherwise Boiling is skipped."
+        let cond = match &input {
+            Some(s) => format!("{o} is {s}"),
+            None => format!("{o} exists"),
+        };
+        let text = match (&l.kind, l.modifier) {
+            (LinkKind::Generalization, _) => format!("{t} is {} {f}.", article(&f)),
+            (LinkKind::Classification, _) => format!("{t} is an instance of {f}."),
+            (LinkKind::Tagged(tag), _) if tag.is_empty() => format!("{f} relates to {}.", counted(&l.multiplicity, None, &t)),
+            (LinkKind::Tagged(tag), _) => format!("{f} {tag} {}.", counted(&l.multiplicity, None, &t)),
+            (LinkKind::Invocation, _) => format!("{f} invokes {t}."),
+            (LinkKind::Agent, Modifier::None) => format!("{} handles {p}.", obj(None)),
+            (LinkKind::Agent, Modifier::Event) => format!("{} initiates and handles {p}.", obj(None)),
+            (LinkKind::Agent, Modifier::Condition) => format!("{p} occurs if {cond}, in which case {o} handles {p}, otherwise {p} is skipped."),
+            (LinkKind::Instrument, Modifier::Condition) => format!("{p} occurs if {cond}, otherwise {p} is skipped."),
+            (_, Modifier::Condition) => format!("{p} occurs if {cond}, in which case {p} {pred}, otherwise {p} is skipped."),
+            (_, Modifier::Event) => format!("{} initiates {p}, which {pred}.", capitalize(&obj(input))),
+            (_, Modifier::None) => format!("{p} {pred}."),
         };
         out.push(Sentence { text, refs: vec![l.from, l.id, l.to] });
     }
     out
+}
+
+fn verb(k: &LinkKind) -> &'static str {
+    match k {
+        LinkKind::Instrument => "requires",
+        LinkKind::Consumption => "consumes",
+        LinkKind::Result => "yields",
+        _ => "affects",
+    }
 }
 
 /// Every diagram's sentences, in tree order, under its title.

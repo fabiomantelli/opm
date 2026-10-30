@@ -5,7 +5,7 @@ use crate::{storage, ui, Drag, Menu, Sel, Target, Ui, P};
 use leptos::{ev, prelude::*};
 use opm_core::{
     layout::{frame_label_y, size},
-    opl, valid_link_kinds, Affiliation, Essence, Id, Kind, Link, LinkKind, Model, Op, Thing,
+    opl, valid_link_kinds, Affiliation, Essence, FanKind, Id, Kind, Link, LinkKind, Model, Modifier, Op, Thing,
 };
 use wasm_bindgen::JsCast;
 
@@ -571,7 +571,7 @@ impl Ui {
             .target()
             .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
             .is_some_and(|el| matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT"));
-        if typing || self.model.get_untracked().is_none() {
+        if typing || self.search.get_untracked() || self.model.get_untracked().is_none() {
             return;
         }
         let ctrl = e.ctrl_key() || e.meta_key();
@@ -607,6 +607,7 @@ impl Ui {
                     self.edit.set(Some(id));
                 }
             }
+            (_, "/") => self.search.set(true),
             (_, "escape") => {
                 self.menu.set(None);
                 self.select(None);
@@ -683,7 +684,80 @@ pub fn glyph(k: &LinkKind) -> impl IntoView {
     }
 }
 
-fn link_view(kind: &LinkKind, g: &LinkGeo, cls: &str, style: LinkStyle) -> impl IntoView {
+/// The piece of a link route that ends nearest `c`, walked from that end.
+fn piece_from(g: &LinkGeo, c: P) -> Option<Vec<P>> {
+    let near = |p: &Vec<P>| dist(p[0], c).min(dist(*p.last().unwrap(), c));
+    let mut p = g.pts.iter().filter(|p| p.len() >= 2).min_by(|a, b| near(a).total_cmp(&near(b)))?.clone();
+    if dist(*p.last().unwrap(), c) < dist(p[0], c) {
+        p.reverse();
+    }
+    Some(p)
+}
+
+/// The point `d` along `poly` from its start, moved `side` px to the left of the route.
+fn along(poly: &[P], d: f64, side: f64) -> P {
+    let mut left = d;
+    for (i, w) in poly.windows(2).enumerate() {
+        let len = dist(w[0], w[1]);
+        if len > 0.0 && (left <= len || i + 2 == poly.len()) {
+            let k = (left / len).min(1.0);
+            let (ux, uy) = ((w[1].0 - w[0].0) / len, (w[1].1 - w[0].1) / len);
+            return (w[0].0 + ux * len * k - uy * side, w[0].1 + uy * len * k + ux * side);
+        }
+        left -= len;
+    }
+    poly[0]
+}
+
+/// Where a link's small labels go: the process end (for "c"/"e") and the counted end (multiplicity).
+pub struct Ends {
+    process: Option<P>,
+    counted: P,
+}
+
+pub fn link_ends(m: &Model, l: &Link) -> Option<Ends> {
+    let center = |t: &Thing| {
+        let (w, h) = size(t);
+        (t.x + w / 2.0, t.y + h / 2.0)
+    };
+    let (f, t) = (m.thing(l.from)?, m.thing(l.to)?);
+    let (process, object) = match (f.kind, t.kind) {
+        (Kind::Object, Kind::Process) => (Some(center(t)), Some(center(f))),
+        (Kind::Process, Kind::Object) => (Some(center(f)), Some(center(t))),
+        _ => (None, None),
+    };
+    Some(Ends { process, counted: if l.kind.is_procedural() { object.unwrap_or(center(t)) } else { center(t) } })
+}
+
+/// XOR (one arc) or OR (two arcs) across the links of a fan, around the end they share.
+pub fn fan_view(m: &Model, routes: &Routes, fan: &opm_core::Fan) -> Option<AnyView> {
+    let end = m.thing(m.fan_end(fan)?)?;
+    let (w, h) = size(end);
+    let c = (end.x + w / 2.0, end.y + h / 2.0);
+    let qs: Vec<P> = fan.links.iter().filter_map(|id| piece_from(routes.links.get(id)?, c)).map(|p| along(&p, 26.0, 0.0)).collect();
+    if qs.len() < 2 {
+        return None;
+    }
+    let r = qs.iter().map(|&q| dist(q, c)).sum::<f64>() / qs.len() as f64;
+    let mut angles: Vec<f64> = qs.iter().map(|q| (q.1 - c.1).atan2(q.0 - c.0)).collect();
+    angles.sort_by(f64::total_cmp);
+    // The arc covers everything but the widest gap between neighboring links.
+    let tau = std::f64::consts::TAU;
+    let n = angles.len();
+    let gap = |i: usize| (angles[(i + 1) % n] - angles[i]).rem_euclid(tau);
+    let widest = (0..n).max_by(|&a, &b| gap(a).total_cmp(&gap(b)))?;
+    let (a0, a1) = (angles[(widest + 1) % n], angles[widest]);
+    let span = (a1 - a0).rem_euclid(tau);
+    let arc = |r: f64| {
+        let large = if span > std::f64::consts::PI { 1 } else { 0 };
+        format!("M{},{} A{r},{r} 0 {large} 1 {},{}", c.0 + r * a0.cos(), c.1 + r * a0.sin(), c.0 + r * a1.cos(), c.1 + r * a1.sin())
+    };
+    let second = (fan.kind == FanKind::Or).then(|| view! { <path class="fan" d=arc(r + 5.0) /> });
+    Some(view! { <g><path class="fan" d=arc(r) />{second}</g> }.into_any())
+}
+
+fn link_view(l: &Link, ends: &Ends, g: &LinkGeo, cls: &str, style: LinkStyle) -> impl IntoView {
+    let kind = &l.kind;
     let (ms, me) = marker_ends(kind, g.d.len() == 2);
     let lines = g.d.iter().map(|d| view! { <path d=d.clone() class=format!("link {cls}") marker-start=ms marker-end=me /> }).collect_view();
     // Mid-link decoration: structural triangle pointing at the whole/general/class (the `from` end),
@@ -704,7 +778,21 @@ fn link_view(kind: &LinkKind, g: &LinkGeo, cls: &str, style: LinkStyle) -> impl 
     } else {
         symbol(kind).map(|s| view! { <g transform=format!("translate({mx},{my}) rotate({angle})")>{s}</g> }.into_any())
     };
-    view! { <g>{lines}{deco}</g> }
+    // "c" (condition) or "e" (event) by the process end; the multiplicity by the object or part end.
+    let letter = match l.modifier {
+        Modifier::Condition => Some("c"),
+        Modifier::Event => Some("e"),
+        Modifier::None => None,
+    };
+    let modifier = letter.zip(ends.process).and_then(|(letter, c)| {
+        let (x, y) = along(&piece_from(g, c)?, 24.0, 10.0);
+        Some(view! { <text class="mod" x=x y=y text-anchor="middle" dominant-baseline="central">{letter}</text> })
+    });
+    let count = (!l.multiplicity.is_empty()).then(|| piece_from(g, ends.counted)).flatten().map(|p| {
+        let (x, y) = along(&p, 20.0, -11.0);
+        view! { <text class="card" x=x y=y text-anchor="middle" dominant-baseline="central">{l.multiplicity.clone()}</text> }
+    });
+    view! { <g>{lines}{deco}{modifier}{count}</g> }
 }
 
 fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>) -> AnyView {
@@ -734,10 +822,16 @@ fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>) -> AnyView {
         .into_iter()
         .zip(&t.states)
         .map(|((sid, x, y, sw, sh), s)| {
-            let c = if sel_state == Some(sid) { "state sel" } else { "state" };
+            let c = format!(
+                "state{}{}{}",
+                if sel_state == Some(sid) { " sel" } else { "" },
+                if s.initial { " initial" } else { "" },
+                if s.final_ { " final" } else { "" },
+            );
             view! {
                 <g class=c>
                     <rect x=x y=y width=sw height=sh rx="12" />
+                    {s.final_.then(|| view! { <rect class="inner" x=x + 3.0 y=y + 3.0 width=sw - 6.0 height=sh - 6.0 rx="9" /> })}
                     <text x=x + sw / 2.0 y=y + sh / 2.0 text-anchor="middle" dominant-baseline="central">{s.name.clone()}</text>
                 </g>
             }
@@ -790,7 +884,7 @@ pub fn Canvas() -> impl IntoView {
                         cls += " fresh";
                     }
                     let ss = sel_state.filter(|s| t.states.iter().any(|x| x.id == *s));
-                    let states: Vec<String> = t.states.iter().map(|s| format!("{}:{}", s.id, s.name)).collect();
+                    let states: Vec<String> = t.states.iter().map(|s| format!("{}:{}:{}{}", s.id, s.name, s.initial, s.final_)).collect();
                     let key = format!(
                         "{}|{}|{}|{}|{:?}|{:?}|{}|{cls}|{ss:?}|{:?}|{:?}",
                         t.id,
@@ -817,6 +911,7 @@ pub fn Canvas() -> impl IntoView {
                 .flat_map(|m| &m.links)
                 .filter_map(|l| {
                     let g = routes.links.get(&l.id)?.clone();
+                    let ends = link_ends(m.as_ref()?, l)?;
                     let cls = if sel == Some(Sel::Link(l.id)) {
                         "sel"
                     } else if hot == Some(Hit::Link(l.id)) || ui.hover.with(|h| h.contains(&l.id)) {
@@ -824,10 +919,14 @@ pub fn Canvas() -> impl IntoView {
                     } else {
                         ""
                     };
-                    Some((format!("{}|{}|{cls}", l.id, g.rev), l.kind.clone(), g, cls, routes.style))
+                    Some((format!("{}|{}|{cls}|{:?}|{}", l.id, g.rev, l.modifier, l.multiplicity), l.clone(), ends, g, cls, routes.style))
                 })
                 .collect::<Vec<_>>()
         })
+    };
+    let fans = move || {
+        let routes = ui.routes.get();
+        ui.model.with(|m| m.as_ref().map(|m| m.fans.iter().filter_map(|f| fan_view(m, &routes, f)).collect_view()))
     };
     let overlays = move || {
         let group = ui.group.get();
@@ -935,8 +1034,9 @@ pub fn Canvas() -> impl IntoView {
                     </g>
                     // Links on top so state-specific links visibly touch their state pill.
                     <g>
-                        <For each=link_items key=|i| i.0.clone() children=|(_, kind, g, cls, style)| link_view(&kind, &g, cls, style) />
+                        <For each=link_items key=|i| i.0.clone() children=|(_, l, ends, g, cls, style)| link_view(&l, &ends, &g, cls, style) />
                     </g>
+                    <g>{fans}</g>
                     {overlays}
                 </g>
             </svg>
