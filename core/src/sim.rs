@@ -33,11 +33,9 @@ impl Sim {
     pub fn new(m: &Model, opd: Id) -> Sim {
         let view = m.view(opd);
         let v = &view;
-        // ponytail: order by position (the layout's time axis); follow invocation links if models need jumps.
-        let in_zoom = v.things.iter().any(|t| t.frame.is_some());
-        let mut procs: Vec<&Thing> = v.things.iter().filter(|t| t.kind == Kind::Process && t.frame.is_none() && (!in_zoom || t.inside)).collect();
-        procs.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
-        let order: Vec<Id> = procs.iter().map(|t| t.id).collect();
+        // ponytail: order by position (the layout's time axis), parallel steps one after another left to
+        // right; follow invocation links if models need jumps, interleave if parallel races matter.
+        let order: Vec<Id> = v.timeline().concat();
         let made: Vec<Id> = v.links.iter().filter(|l| l.kind == LinkKind::Result && order.contains(&l.from)).map(|l| l.to).collect();
         let made: Vec<Id> = m.links.iter().filter(|l| l.kind == LinkKind::Result && order.contains(&l.from)).map(|l| l.to).chain(made).collect();
         let exists = m.things.iter().filter(|t| t.kind == Kind::Object && !made.contains(&t.id)).map(|t| (t.id, start_state(t))).collect();

@@ -1,5 +1,5 @@
 //! Object-Process Language: the English sentences equivalent to the diagram.
-use crate::{Affiliation, Essence, FanKind, Id, Kind, Link, LinkKind, Modifier, Model, Thing};
+use crate::{Affiliation, Essence, FanKind, Id, Kind, Link, LinkKind, Modifier, Model};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -68,13 +68,20 @@ pub fn render(m: &Model) -> Vec<Sentence> {
 
     // In-zoom: "Producing zooms into Measuring, Buffering, and Publishing, in that sequence."
     if let Some(f) = m.things.iter().find(|t| t.frame.is_some()) {
-        let mut procs: Vec<&Thing> = m.things.iter().filter(|t| t.inside && t.kind == Kind::Process).collect();
-        procs.sort_by(|a, b| a.y.total_cmp(&b.y));
+        let steps = m.timeline();
         let objs: Vec<String> = m.things.iter().filter(|t| t.inside && t.kind == Kind::Object).map(|t| t.name.clone()).collect();
-        let names: Vec<String> = procs.iter().map(|t| t.name.clone()).collect();
+        let names: Vec<String> = steps
+            .iter()
+            .map(|step| match step.as_slice() {
+                [one] => name(*one),
+                _ => format!("parallel {}", list(&step.iter().map(|&id| name(id)).collect::<Vec<_>>(), "and")),
+            })
+            .collect();
         let mut text = match names.len() {
             0 => String::new(),
             1 => format!("{} zooms into {}", f.name, names[0]),
+            // A comma before the last step keeps "parallel A and B, and C" unambiguous.
+            2 if steps.iter().any(|s| s.len() > 1) => format!("{} zooms into {}, and {}, in that sequence", f.name, names[0], names[1]),
             _ => format!("{} zooms into {}, in that sequence", f.name, list(&names, "and")),
         };
         if !objs.is_empty() {

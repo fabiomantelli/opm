@@ -96,6 +96,9 @@ pub struct Shown {
     pub inside: bool,
 }
 
+/// Processes whose centers are this close vertically are level: they run in parallel.
+pub const PARALLEL: f64 = 20.0;
+
 /// An object-process diagram. The root (SD) has no parent and refines nothing.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Opd {
@@ -389,6 +392,16 @@ pub enum Op {
     },
     /// Marks `thing` as satisfying `requirement` (or not).
     Trace { requirement: Id, thing: Id, satisfies: bool },
+    /// Out-zooming: puts `things` of diagram `opd` (default: the root) inside a new process `name`, in a
+    /// new in-zoom diagram under `opd`. Their links to the rest become the new process's links, so `opd`
+    /// keeps the summary. Objects go inside only if all their procedural links are with grouped processes.
+    /// Returns the new process's id.
+    Group {
+        #[serde(default)]
+        opd: Option<Id>,
+        things: Vec<Id>,
+        name: String,
+    },
     /// Thing (from the whole model, with its links and detail diagrams), state, link, or requirement.
     Remove { id: Id },
     /// Paste into `opd`: things (with states) and the links among them, carrying any ids, placed at
@@ -542,6 +555,33 @@ impl Model {
     /// Diagrams showing `thing`.
     pub fn shown_in(&self, thing: Id) -> Vec<Id> {
         self.opds.iter().filter(|o| o.shows.iter().any(|s| s.thing == thing)).map(|o| o.id).collect()
+    }
+
+    /// In a diagram view: its processes in time order, top to bottom (in an in-zoom view, only the
+    /// subprocesses). Processes level with each other share a step: they run in parallel, left to right.
+    pub fn timeline(&self) -> Vec<Vec<Id>> {
+        let zoom = self.things.iter().any(|t| t.frame.is_some());
+        let mut procs: Vec<(f64, f64, Id)> = self
+            .things
+            .iter()
+            .filter(|t| t.kind == Kind::Process && t.frame.is_none() && (!zoom || t.inside))
+            .map(|t| (t.y + layout::size(t).1 / 2.0, t.x, t.id))
+            .collect();
+        procs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        let mut steps: Vec<(f64, Vec<(f64, Id)>)> = vec![];
+        for (cy, x, id) in procs {
+            match steps.last_mut() {
+                Some((top, step)) if cy - *top < PARALLEL => step.push((x, id)),
+                _ => steps.push((cy, vec![(x, id)])),
+            }
+        }
+        steps
+            .into_iter()
+            .map(|(_, mut step)| {
+                step.sort_by(|a, b| a.0.total_cmp(&b.0));
+                step.into_iter().map(|(_, id)| id).collect()
+            })
+            .collect()
     }
 
     /// Things inside the in-zoomed process of `opd`.
@@ -712,10 +752,11 @@ impl Model {
         }
     }
 
-    /// A free-ish spot for a thing added without a position (automatic arranging tidies it afterwards).
+    /// A free-ish spot for a thing added without a position (automatic arranging tidies it afterwards),
+    /// staggered so two never look level (parallel).
     fn spot(&self, opd: Id) -> (f64, f64) {
         let n = self.opd(opd).map_or(0, |o| o.shows.len());
-        (80.0 + (n % 5) as f64 * 220.0, 80.0 + (n / 5) as f64 * 130.0)
+        (80.0 + (n % 5) as f64 * 220.0, 80.0 + (n / 5) as f64 * 130.0 + (n % 5) as f64 * 25.0)
     }
 
     /// Default for `inside`: in an in-zoom diagram, new processes are subprocesses.
@@ -845,6 +886,99 @@ impl Model {
                     }
                 }
                 Ok(id)
+            }
+            Op::Group { opd, things, name } => {
+                let opd = opd.unwrap_or(self.root());
+                let o = self.opd(opd).ok_or("no such diagram")?.clone();
+                let at = |t: Id| o.shows.iter().find(|s| s.thing == t).cloned();
+                if things.iter().any(|&t| o.refines == Some(t) || at(t).is_none()) {
+                    return Err("group things shown in this diagram (not the process it details)".into());
+                }
+                let is_proc = |m: &Model, t: Id| m.thing(t).is_some_and(|t| t.kind == Kind::Process);
+                let procs: Vec<Id> = things.iter().copied().filter(|&t| is_proc(self, t)).collect();
+                if procs.is_empty() {
+                    return Err("select at least one process to group".into());
+                }
+                let name = self.check_name(&name, None)?;
+                let other = |l: &Link, t: Id| if l.from == t { l.to } else { l.from };
+                let mut inner = procs.clone();
+                for &t in things.iter().filter(|t| !procs.contains(t)) {
+                    if self.links.iter().filter(|l| l.kind.is_procedural() && (l.from == t || l.to == t)).all(|l| procs.contains(&other(l, t))) {
+                        inner.push(t);
+                    }
+                }
+                let mut inner_at: Vec<Shown> = inner.iter().filter_map(|&t| at(t)).collect();
+                inner_at.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+                let n = inner_at.len() as f64;
+                let (cx, cy) = (inner_at.iter().map(|s| s.x).sum::<f64>() / n, inner_at.iter().map(|s| s.y).sum::<f64>() / n);
+                let inside = procs.iter().any(|&t| at(t).is_some_and(|s| s.inside));
+                let auto = inner_at.iter().all(|s| s.auto);
+                let p = self.apply(Op::AddThing {
+                    name,
+                    kind: Kind::Process,
+                    essence: Essence::default(),
+                    affiliation: Affiliation::default(),
+                    opd: Some(opd),
+                    x: Some(cx.round()),
+                    y: Some(cy.round()),
+                    inside: Some(inside),
+                })?;
+                if let Some(s) = self.opd_mut(opd)?.shows.iter_mut().find(|s| s.thing == p) {
+                    s.auto = auto;
+                }
+                // Links to the rest now go to the new process; states only when one link says it all.
+                let mut summary: Vec<(Id, Id, LinkKind, Option<Id>, Option<Id>, usize)> = vec![];
+                let mut outside: Vec<Id> = vec![];
+                for l in self.links.iter().filter(|l| l.kind.is_procedural()) {
+                    let (a, b) = (inner.contains(&l.from), inner.contains(&l.to));
+                    if a == b || o.refines == Some(if a { l.to } else { l.from }) {
+                        continue;
+                    }
+                    let (from, to) = if a { (p, l.to) } else { (l.from, p) };
+                    outside.push(if a { l.to } else { l.from });
+                    match summary.iter_mut().find(|x| (x.0, x.1, &x.2) == (from, to, &l.kind)) {
+                        Some(x) => x.5 += 1,
+                        None => summary.push((from, to, l.kind.clone(), l.from_state, l.to_state, 1)),
+                    }
+                }
+                for (from, to, kind, fs, ts, n) in summary {
+                    let (from_state, to_state) = if n == 1 { (fs, ts) } else { (None, None) };
+                    if !self.links.iter().any(|l| l.from == from && l.to == to && l.kind == kind) {
+                        let _ = self.apply(Op::AddLink { from, to, kind, from_state, to_state });
+                    }
+                }
+                // The new process's in-zoom diagram: the group inside, in the order it was drawn (level
+                // ones stay parallel only if they already were, in an in-zoom diagram), its neighbors outside.
+                let keep_level = o.refines.is_some() && !o.unfold;
+                let mut shows = vec![Shown { thing: p, x: 0.0, y: 0.0, auto: true, inside: false }];
+                for (i, s) in inner_at.iter().enumerate() {
+                    let y = if keep_level { s.y } else { i as f64 * 100.0 };
+                    shows.push(Shown { thing: s.thing, x: s.x, y, auto: true, inside: true });
+                }
+                for x in outside {
+                    if !shows.iter().any(|s| s.thing == x) {
+                        shows.push(Shown { thing: x, x: 0.0, y: 0.0, auto: true, inside: false });
+                    }
+                }
+                let z = self.fresh();
+                self.opds.push(Opd { id: z, parent: Some(opd), refines: Some(p), unfold: false, shows, routes: vec![] });
+                for d in &mut self.opds {
+                    if d.parent == Some(opd) && d.refines.is_some_and(|r| inner.contains(&r)) {
+                        d.parent = Some(z);
+                    }
+                }
+                let gone: Vec<Id> = self.links.iter().filter(|l| inner.contains(&l.from) || inner.contains(&l.to)).map(|l| l.id).collect();
+                let d = self.opd_mut(opd)?;
+                d.shows.retain(|s| !inner.contains(&s.thing));
+                d.routes.retain(|r| !gone.contains(&r.link));
+                let moves = layout::tidy_opd(self, z);
+                let zo = self.opd_mut(z)?;
+                for (t, x, y) in moves {
+                    if let Some(s) = zo.shows.iter_mut().find(|s| s.thing == t) {
+                        (s.x, s.y) = (x, y);
+                    }
+                }
+                Ok(p)
             }
             Op::RemoveOpd { opd } => {
                 if opd == self.root() {

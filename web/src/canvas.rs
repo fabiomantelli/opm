@@ -287,6 +287,23 @@ impl Ui {
         });
     }
 
+    /// Out-zooming: the selected things go inside a new process with its own in-zoom diagram; the
+    /// new process takes their place here, ready to be named.
+    pub fn group_selected(self) {
+        let (Some(full), things) = (self.full.get_untracked(), self.group.get_untracked()) else { return };
+        if things.is_empty() {
+            return;
+        }
+        let name = (1..).map(|i| if i == 1 { "Processing".to_string() } else { format!("Processing {i}") }).find(|n| full.find(n).is_none()).unwrap();
+        self.send(vec![Op::Group { opd: Some(self.here()), things, name }], move |ids| {
+            if let Some(&p) = ids.first() {
+                self.select(Some(Sel::Thing(p)));
+                self.edit.set(Some(p));
+                self.say("Grouped: double-click the new process to see its subprocesses");
+            }
+        });
+    }
+
     /// Shows a thing from elsewhere in the model in this diagram, at the center of the view.
     pub fn show_existing(self, id: Id) {
         let (px, py, z) = self.view.get_untracked();
@@ -755,6 +772,7 @@ impl Ui {
                     self.pointer.set_value(pointer);
                 }
             }
+            (true, "g") => self.group_selected(),
             (true, "a") => self.select_things(self.model.with_untracked(|m| m.iter().flat_map(|m| &m.things).map(|t| t.id).collect())),
             (true, _) => return,
             (_, " ") => self.space.set(true),
@@ -1326,6 +1344,11 @@ fn ContextBar() -> impl IntoView {
                 ((x0 + x1) / 2.0, y0),
                 view! {
                     <span class="ctx-label">{group.len()} " selected"</span>
+                    {group.iter().any(|&id| m.thing(id).is_some_and(|t| t.kind == Kind::Process && t.frame.is_none())).then(|| view! {
+                        <button class="ctx-btn" title="Group into a new process with its own in-zoom diagram (Ctrl+G)" on:click=move |_| ui.group_selected()>
+                            <svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="10" ry="8" class="ic line" /><ellipse cx="9" cy="10" rx="3.5" ry="2" class="ic line" /><ellipse cx="15" cy="14.5" rx="3.5" ry="2" class="ic line" /></svg>
+                        </button>
+                    })}
                     <button class="ctx-btn danger-ic" title="Delete (Del)" on:click=move |_| ui.remove_selected()>{icon_trash()}</button>
                 }
                 .into_any(),

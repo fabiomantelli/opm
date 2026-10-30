@@ -79,6 +79,14 @@ mudou em todos os diagramas que o mostram.
 - **Zoom in** (processo): abre um diagrama de detalhe onde o processo vira uma moldura grande com seus
   subprocessos dentro, **em ordem de tempo de cima para baixo**. O que o processo toca já vem junto, do lado de fora.
   Itens criados dentro da moldura viram parte dela; o painel do item tem *Inside / Outside* para mudar.
+- **Paralelo**: subprocessos **na mesma altura** rodam ao mesmo tempo (é a regra do OPM). Arraste um para
+  o lado do outro (ele encaixa na altura); o OPL passa a dizer *"zooms into parallel A and B, and C"*,
+  a simulação roda os dois no mesmo passo e o *Tidy* (T) mantém os dois lado a lado.
+- **Agrupar em processo (out-zoom, Ctrl+G)**: selecione processos (Shift+clique ou laço) e clique no
+  botão de agrupar. Eles — e os objetos que só eles usam — vão para dentro de um processo novo, com seu
+  próprio diagrama de in-zoom; as ligações com o resto sobem para o processo novo, então o diagrama de
+  cima continua balanceado. Detalhes que eles já tinham passam a ficar embaixo do novo diagrama. Dê o nome
+  e pronto (Ctrl+Z desfaz). É o caminho de baixo para cima: desenhe tudo achatado e depois organize.
 - **Unfold** (objeto ou processo): diagrama de detalhe com suas partes, atributos e especializações.
 - Botões no menu flutuante do item ou no painel; **duplo clique** num item com detalhe (contorno grosso,
   como na notação OPM) abre o diagrama dele. Navegue pelo caminho no topo do canvas (SD › SD1…)
@@ -177,7 +185,7 @@ arrastar à mão ficam onde você deixou; dali em diante a IA só encaixa os ite
 `T` (Tidy) reorganiza tudo e devolve o layout ao modo automático.
 
 Ferramentas que o ChatGPT recebe: `list_models`, `create_model`, `add_things` (num diagrama: `diagram="SD1"`),
-`add_links` (com `modifier` condition/event e `multiplicity`), `fan` (agrupa ligações em XOR/OR), `add_requirements` (cria e rastreia requisitos), `simulate` (roda um diagrama e devolve o registro), `export_sysml`, `zoom_in` e `unfold` (criam diagramas de detalhe), `remove` (do modelo, ou só de um diagrama),
+`add_links` (com `modifier` condition/event e `multiplicity`), `fan` (agrupa ligações em XOR/OR), `add_requirements` (cria e rastreia requisitos), `simulate` (roda um diagrama e devolve o registro), `export_sysml`, `zoom_in` e `unfold` (criam diagramas de detalhe; em `add_things`, `parallel_with` põe um subprocesso em paralelo com outro), `group` (out-zoom: agrupa processos num processo novo), `remove` (do modelo, ou só de um diagrama),
 `arrange` (reorganiza um diagrama inteiro) e `get_model` (árvore de diagramas, OPL de cada um e os checks).
 O guia que a IA recebe pede para nunca omitir itens para "caber": diagramas grandes viram refinamentos.
 

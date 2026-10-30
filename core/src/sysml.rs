@@ -91,14 +91,15 @@ pub fn export(m: &Model) -> String {
             }
             // In-zoomed: its subprocesses, in time order.
             if let Some(o) = m.opds.iter().find(|o| o.refines == Some(t.id) && !o.unfold) {
-                let mut subs: Vec<(f64, &Thing)> =
-                    o.shows.iter().filter(|s| s.inside).filter_map(|s| Some((s.y, thing(s.thing)?))).filter(|(_, x)| x.kind == Kind::Process).collect();
-                subs.sort_by(|a, b| a.0.total_cmp(&b.0));
-                for (_, s) in &subs {
+                let steps: Vec<Vec<&Thing>> = m.view(o.id).timeline().iter().map(|step| step.iter().filter_map(|&id| thing(id)).collect()).collect();
+                for s in steps.iter().flatten() {
                     body.push(format!("action {} : {};", feature(&s.name), name(&s.name)));
                 }
-                for w in subs.windows(2) {
-                    body.push(format!("first {} then {};", feature(&w[0].1.name), feature(&w[1].1.name)));
+                // Parallel subprocesses all follow the step before and precede the step after.
+                for w in steps.windows(2) {
+                    for (a, b) in w[0].iter().flat_map(|a| w[1].iter().map(move |b| (a, b))) {
+                        body.push(format!("first {} then {};", feature(&a.name), feature(&b.name)));
+                    }
                 }
             }
         }

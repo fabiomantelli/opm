@@ -338,7 +338,7 @@ fn sequence(v: &Model, procs: &[&Thing]) -> Vec<Id> {
         }
     }
     let mut order: Vec<&&Thing> = procs.iter().collect();
-    order.sort_by_key(|t| (rank[&t.id], t.id));
+    order.sort_by(|a, b| rank[&a.id].cmp(&rank[&b.id]).then(a.y.total_cmp(&b.y)).then(a.id.cmp(&b.id)));
     order.into_iter().map(|t| t.id).collect()
 }
 
@@ -363,11 +363,26 @@ fn zoom_tidy(v: &Model, frame: Id) -> Vec<(Id, f64, f64)> {
     let procs: Vec<&Thing> = v.things.iter().filter(|t| t.inside && t.kind == Kind::Process).collect();
     let mut pos: HashMap<Id, (f64, f64)> = HashMap::new();
     let sz = |id: Id| v.thing(id).map(size).unwrap_or((0.0, 0.0));
-    let mut y = 0.0;
-    let pw = procs.iter().map(|t| size(t).0).fold(0.0, f64::max);
+    // Steps in sequence order; parallel subprocesses (already level) stay side by side in one row.
+    let steps = v.timeline();
+    let mut rows: Vec<Vec<Id>> = vec![];
     for id in sequence(v, &procs) {
-        let (w, h) = sz(id);
-        pos.insert(id, (-w / 2.0, y));
+        if !rows.iter().any(|r| r.contains(&id)) {
+            rows.push(steps.iter().find(|s| s.contains(&id)).cloned().unwrap_or(vec![id]));
+        }
+    }
+    let mut y = 0.0;
+    let mut pw: f64 = 0.0;
+    for row in rows {
+        let total = row.iter().map(|&id| sz(id).0).sum::<f64>() + 60.0 * (row.len() - 1) as f64;
+        let h = row.iter().map(|&id| sz(id).1).fold(0.0, f64::max);
+        let mut x = -total / 2.0;
+        for id in row {
+            let (w, ih) = sz(id);
+            pos.insert(id, (x, y + (h - ih) / 2.0));
+            x += w + 60.0;
+        }
+        pw = pw.max(total);
         y += h + 40.0;
     }
     let center_y = |pos: &HashMap<Id, (f64, f64)>, ids: &[Id]| {

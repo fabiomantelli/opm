@@ -524,3 +524,62 @@ fn hand_routes_belong_to_one_diagram_and_go_with_their_link() {
     m.apply(Op::Remove { id: l }).unwrap();
     assert!(m.opds[0].routes.is_empty(), "the route goes with its link");
 }
+
+#[test]
+fn level_subprocesses_run_in_parallel_and_grouping_zooms_out() {
+    use opm_core::sim::Sim;
+    // SD: Ore -> Crushing -> Grit -> Washing -> Clean Grit -> Sorting -> Gravel.
+    let mut m = Model::new("Quarry");
+    let sd = m.root();
+    let ore = add(&mut m, "Ore", Kind::Object);
+    let grit = add(&mut m, "Grit", Kind::Object);
+    let clean = add(&mut m, "Clean Grit", Kind::Object);
+    let gravel = add(&mut m, "Gravel", Kind::Object);
+    let crushing = add(&mut m, "Crushing", Kind::Process);
+    let washing = add(&mut m, "Washing", Kind::Process);
+    let sorting = add(&mut m, "Sorting", Kind::Process);
+    link(&mut m, ore, crushing, LinkKind::Consumption).unwrap();
+    link(&mut m, crushing, grit, LinkKind::Result).unwrap();
+    link(&mut m, grit, washing, LinkKind::Consumption).unwrap();
+    link(&mut m, washing, clean, LinkKind::Result).unwrap();
+    link(&mut m, clean, sorting, LinkKind::Consumption).unwrap();
+    link(&mut m, sorting, gravel, LinkKind::Result).unwrap();
+
+    // Out-zoom: Washing and Sorting (and Clean Grit, used only by them) become Finishing.
+    let fin = m.apply(Op::Group { opd: None, things: vec![washing, sorting, clean], name: "Finishing".into() }).unwrap();
+    let z = m.detail_of(fin).unwrap();
+    assert_eq!(m.opd(z).unwrap().parent, Some(sd));
+    let top = m.view(sd);
+    assert!(top.thing(washing).is_none() && top.thing(clean).is_none(), "the group lives one level down");
+    let has = |v: &Model, f: u32, t: u32, k: LinkKind| v.links.iter().any(|l| l.from == f && l.to == t && l.kind == k);
+    assert!(has(&top, grit, fin, LinkKind::Consumption) && has(&top, fin, gravel, LinkKind::Result), "the SD keeps the summary");
+    let v = m.view(z);
+    assert!(v.thing(washing).unwrap().inside && v.thing(clean).unwrap().inside && !v.thing(grit).unwrap().inside);
+    assert!(has(&v, grit, washing, LinkKind::Consumption));
+    assert!(!opm_core::check::check(&m).iter().any(|i| i.opd == z), "{:?}", opm_core::check::check(&m));
+    let opl: Vec<_> = opl::render(&v).into_iter().map(|s| s.text).collect();
+    assert_eq!(opl[0], "Finishing zooms into Washing and Sorting, in that sequence, as well as Clean Grit.");
+    m.validate().unwrap();
+
+    // Level subprocesses are parallel: in the OPL, the simulation and a re-tidy.
+    let polishing = m.apply(Op::AddThing { name: "Polishing".into(), kind: Kind::Process, essence: Essence::Informatical, affiliation: Default::default(), opd: Some(z), x: None, y: None, inside: None }).unwrap();
+    link(&mut m, polishing, clean, LinkKind::Effect).unwrap();
+    for (id, x, y) in opm_core::layout::tidy_opd(&m, z) {
+        mv(&mut m, Some(z), id, x, y, true);
+    }
+    assert_eq!(m.view(z).timeline().len(), 3, "a new subprocess comes after, not beside");
+    let w = m.view(z).thing(washing).unwrap().clone();
+    mv(&mut m, Some(z), polishing, w.x + 300.0, w.y + 5.0, true);
+    let v = m.view(z);
+    assert_eq!(v.timeline(), vec![vec![washing, polishing], vec![sorting]]);
+    let opl: Vec<_> = opl::render(&v).into_iter().map(|s| s.text).collect();
+    assert_eq!(opl[0], "Finishing zooms into parallel Washing and Polishing, and Sorting, in that sequence, as well as Clean Grit.");
+    for (id, x, y) in opm_core::layout::tidy_opd(&m, z) {
+        mv(&mut m, Some(z), id, x, y, true);
+    }
+    let v = m.view(z);
+    assert_eq!(v.timeline(), vec![vec![washing, polishing], vec![sorting]], "tidy keeps parallel steps");
+    assert_apart(&v);
+    assert_eq!(Sim::new(&m, z).order, vec![washing, polishing, sorting]);
+    assert!(opm_core::sysml::export(&m).contains("first polishing then sorting;"));
+}

@@ -30,6 +30,9 @@ cutting:
   objects used only inside it (inside=true), and other outside things (inside=false). Link outside objects to the specific
   subprocesses that use or yield them (they show up in the diagram automatically). Keep the SD links as the summary: every
   object a subprocess touches is also linked to the parent process; get_model's checks report what's unbalanced.
+  Subprocesses run top to bottom; to make one run at the same time as another, give it parallel_with=<that one>.
+- group(things, name) is the reverse (out-zooming): it puts processes already drawn, and objects only they use, inside a
+  new process with its own in-zoom diagram, and moves their outside links up to it. Use it to tidy a crowded diagram.
 - unfold(thing) opens a diagram for an object's (or process's) parts, attributes and specializations.
 - Refine as deep as useful (SD1.1...), usually 2-3 levels.
 Link kinds (from -> to):
@@ -150,6 +153,21 @@ pub struct ThingSpec {
     /// States it ends in.
     #[serde(default)]
     final_states: Vec<String>,
+    /// In an in-zoom diagram: the subprocess this one runs in parallel with (drawn level with it).
+    #[serde(default)]
+    parallel_with: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct GroupThings {
+    model: String,
+    /// Diagram they are in: label ("SD1") or the name of the refined thing. Default: SD.
+    #[serde(default)]
+    diagram: Option<String>,
+    /// Processes to put inside the new process, plus objects used only by them.
+    things: Vec<String>,
+    /// Name of the new process (a gerund, e.g. 'Finishing').
+    name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -343,6 +361,7 @@ impl Mcp {
         self.app.edit(&p.model, "AI", |m| {
             let opd = diagram(m, &p.diagram)?;
             let mut touched = vec![];
+            let mut level = vec![];
             for t in p.things {
                 let kind = match t.kind.trim().to_lowercase().as_str() {
                     "object" => Kind::Object,
@@ -367,6 +386,9 @@ impl Mcp {
                     })?,
                 };
                 touched.push(id);
+                if let Some(w) = &t.parallel_with {
+                    level.push((id, w.clone()));
+                }
                 for s in t.states {
                     if !m.thing(id).unwrap().states.iter().any(|x| x.name.eq_ignore_ascii_case(&s)) {
                         m.apply(Op::AddState { thing: id, name: s }).map_err(|e| format!("'{}': {e}", t.name))?;
@@ -381,7 +403,35 @@ impl Mcp {
                 }
             }
             auto_arrange(m, &touched)?;
+            // Parallel subprocesses: level with their partner, to its right; a tidy diagram is re-tidied.
+            for (id, with) in &level {
+                let v = m.view(opd);
+                let (a, b) = (v.thing(*id).ok_or("not in this diagram")?, thing_id(m, with).ok().and_then(|w| v.thing(w)));
+                let b = b.ok_or_else(|| format!("parallel_with: '{with}' isn't in this diagram"))?;
+                let ((_, ah), (bw, bh)) = (opm_core::layout::size(a), opm_core::layout::size(b));
+                let op = Op::Move { opd: Some(opd), id: *id, x: b.x + bw + 60.0, y: b.y + bh / 2.0 - ah / 2.0, auto: a.auto };
+                m.apply(op)?;
+            }
+            if !level.is_empty() && m.view(opd).things.iter().filter(|t| t.frame.is_none()).all(|t| t.auto) {
+                for (id, x, y) in opm_core::layout::tidy_opd(m, opd) {
+                    m.apply(Op::Move { opd: Some(opd), id, x, y, auto: true })?;
+                }
+            }
             Ok(summary(&p.model, m))
+        })
+    }
+
+    #[tool(description = "Out-zoom: put processes of a diagram (and objects only they use) inside a new process, in a new in-zoom diagram under that one. Their links to the rest move up to the new process as the summary. Returns the new diagram's label.")]
+    async fn group(&self, Parameters(p): Parameters<GroupThings>) -> Result<String, String> {
+        self.app.edit(&p.model, "AI", |m| {
+            let opd = diagram(m, &p.diagram)?;
+            let things = p.things.iter().map(|n| thing_id(m, n)).collect::<Result<Vec<_>, _>>()?;
+            let id = m.apply(Op::Group { opd: Some(opd), things, name: p.name.clone() })?;
+            auto_arrange(m, &[id])?;
+            let z = m.detail_of(id).ok_or("no diagram")?;
+            Ok(format!("{} — its subprocesses are inside it
+
+{}", m.title(z), summary(&p.model, m)))
         })
     }
 
