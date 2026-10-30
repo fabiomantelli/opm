@@ -790,7 +790,7 @@ fn link_view(l: &Link, ends: &Ends, g: &LinkGeo, cls: &str, style: LinkStyle) ->
     });
     let count = (!l.multiplicity.is_empty()).then(|| piece_from(g, ends.counted)).flatten().map(|p| {
         let (x, y) = along(&p, 20.0, -11.0);
-        view! { <text class="card" x=x y=y text-anchor="middle" dominant-baseline="central">{l.multiplicity.clone()}</text> }
+        view! { <text class="mult" x=x y=y text-anchor="middle" dominant-baseline="central">{l.multiplicity.clone()}</text> }
     });
     view! { <g>{lines}{deco}{modifier}{count}</g> }
 }

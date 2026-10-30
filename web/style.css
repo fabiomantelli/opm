@@ -377,7 +377,7 @@ kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5p
 
 /* condition/event marks, multiplicities, XOR/OR fans, initial/final states */
 .mod { font-size: 13px; font-weight: 700; font-style: italic; fill: var(--ink); pointer-events: none; }
-.card { font-size: 12px; font-weight: 600; fill: var(--ink); pointer-events: none; }
+.mult { font-size: 12px; font-weight: 600; fill: var(--ink); pointer-events: none; }
 .fan { fill: none; stroke: var(--ink); stroke-width: 1.6; pointer-events: none; }
 .state.initial > rect:first-child { stroke-width: 3.2; }
 .state .inner { fill: none; stroke: var(--state); stroke-width: 1.2; }
