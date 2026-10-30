@@ -1,0 +1,15 @@
+[package]
+name = "opm-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+opm-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+rmcp = { version = "3.7", features = ["server", "transport-streamable-http-server", "macros"] }
+schemars = "1"
+tower = "0.5"
