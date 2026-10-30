@@ -37,9 +37,16 @@ pub struct Sim {
     pub seed: u64,
 }
 
-/// The state an object starts or appears in: the one marked initial, else the first.
-fn start_state(t: &Thing) -> Option<Id> {
-    t.states.iter().find(|s| s.initial).or(t.states.first()).map(|s| s.id)
+/// The state an object is in when the run starts: initial, else default, else the first (its own or inherited).
+fn start_state(m: &Model, t: &Thing) -> Option<Id> {
+    let ss = m.all_states(t.id);
+    ss.iter().find(|s| s.initial).or(ss.iter().find(|s| s.default_)).or(ss.first()).map(|s| s.id)
+}
+
+/// The state an object gets when a process yields it without saying which: default, else initial, else the first.
+fn yield_state(m: &Model, t: &Thing) -> Option<Id> {
+    let ss = m.all_states(t.id);
+    ss.iter().find(|s| s.default_).or(ss.iter().find(|s| s.initial)).or(ss.first()).map(|s| s.id)
 }
 
 /// The object end of a link between an object and a process.
@@ -82,7 +89,7 @@ impl Sim {
         let order: Vec<Id> = steps.concat().into_iter().filter(|&p| !started(p)).collect();
         let all: Vec<Id> = steps.concat();
         let made: Vec<Id> = m.links.iter().filter(|l| l.kind == LinkKind::Result && all.contains(&l.from)).map(|l| l.to).collect();
-        let exists = m.things.iter().filter(|t| t.kind == Kind::Object && !made.contains(&t.id)).map(|t| (t.id, start_state(t))).collect();
+        let exists = m.things.iter().filter(|t| t.kind == Kind::Object && !made.contains(&t.id)).map(|t| (t.id, start_state(m, t))).collect();
         Sim {
             exists,
             order,
@@ -149,12 +156,15 @@ impl Sim {
         let state = |id: Option<Id>| id.and_then(|s| v.state(s)).map(|(_, s)| s.name.clone());
         self.last = Some(p);
         let touches: Vec<&Link> = v.links.iter().filter(|l| l.from == p || l.to == p).collect();
-        let needs: Vec<&Link> = touches.iter().copied().filter(|l| l.modifiable() && object_end(v, l).is_some()).collect();
-        // Inputs are judged on what existed before this process ran.
+        let needs: Vec<&Link> = touches.iter().copied().filter(|l| l.modifiable() && object_end(v, l).is_some() && l.modifier != Modifier::NotCondition).collect();
+        let unless: Vec<&Link> = touches.iter().copied().filter(|l| l.modifier == Modifier::NotCondition).collect();
+        // Inputs are judged on what existed before this process ran. A specialization stands in for
+        // what it specializes: a process using Car can use a Sedan.
         let before = self.exists.clone();
+        let present = |o: Id| std::iter::once(o).chain(v.descendants(o)).find(|x| before.contains_key(x));
         let met = |l: &Link| {
             let o = object_end(v, l).unwrap();
-            before.get(&o).is_some_and(|cur| l.from_state.is_none() || *cur == l.from_state)
+            std::iter::once(o).chain(v.descendants(o)).any(|x| before.get(&x).is_some_and(|cur| l.from_state.is_none() || *cur == l.from_state))
         };
         // Alternatives (XOR/OR) among inputs: one of them is enough.
         let enough = |l: &Link| match v.fan_of(l.id) {
@@ -175,6 +185,19 @@ impl Sim {
                 s.next += 1;
             }
         };
+        // Path labels: inputs and outputs labeled alike go together. The path taken is the first whose
+        // labeled inputs are all there; inputs and outputs of other paths are left alone.
+        let mut paths: Vec<&str> = needs.iter().map(|l| l.path.as_str()).filter(|p| !p.is_empty()).collect();
+        paths.sort();
+        paths.dedup();
+        let taken: Option<String> = paths.iter().find(|&&path| needs.iter().filter(|l| l.path == path).all(|l| enough(l))).map(|p| p.to_string());
+        let on_path = |l: &Link| l.path.is_empty() || paths.is_empty() || taken.is_none() || taken.as_deref() == Some(l.path.as_str());
+        let needs: Vec<&Link> = needs.iter().copied().filter(|l| on_path(l)).collect();
+        if let Some(l) = unless.iter().find(|l| met(l)) {
+            self.log.push(format!("{} skipped: {} is there.", name(p), what(l)));
+            advance(self);
+            return true;
+        }
         if let Some(l) = needs.iter().find(|l| l.modifier == Modifier::Condition && !enough(l)) {
             self.log.push(format!("{} skipped: no {}.", name(p), what(l)));
             advance(self);
@@ -208,8 +231,13 @@ impl Sim {
             skip.extend(ls.iter().map(|l| l.id).filter(|id| !keep.contains(id)));
         }
         let mut did = vec![];
-        for l in touches.iter().copied() {
+        if let Some(path) = &taken {
+            did.push(format!("following path {path}"));
+        }
+        for l in touches.iter().copied().filter(|l| taken.is_none() || on_path(l)) {
             let Some(o) = object_end(v, l) else { continue };
+            // What is actually there for it: the object, or a specialization standing in.
+            let o = if l.kind == LinkKind::Result { o } else { present(o).unwrap_or(o) };
             // An input alternative that isn't there just isn't used.
             if l.kind != LinkKind::Result && v.fan_of(l.id).is_some() && !met(l) {
                 continue;
@@ -230,7 +258,7 @@ impl Sim {
                 }
                 LinkKind::Result if !skip.contains(&l.id) => {
                     let t = v.thing(o).unwrap();
-                    let s = l.to_state.or(start_state(t));
+                    let s = l.to_state.or(yield_state(v, t));
                     self.exists.insert(o, s);
                     did.push(match state(s) {
                         Some(s) if l.to_state.is_some() => format!("yielded {} ({s})", name(o)),

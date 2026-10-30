@@ -639,6 +639,25 @@ fn Inspector() -> impl IntoView {
                             </div>
                         }
                     });
+                    let inherits = ui.full.with(|f| {
+                        let f = f.as_ref()?;
+                        let from: Vec<String> = f.ancestors(id).iter().filter_map(|a| f.thing(*a)).map(|a| a.name.clone()).collect();
+                        if from.is_empty() {
+                            return None;
+                        }
+                        let own: Vec<Id> = f.thing(id)?.states.iter().map(|s| s.id).collect();
+                        let states: Vec<String> = f.all_states(id).into_iter().filter(|s| !own.contains(&s.id)).map(|s| s.name.clone()).collect();
+                        let feats: Vec<String> = f.inherited_features(id).into_iter().filter_map(|(_, l)| f.thing(l.to)).map(|t| t.name.clone()).collect();
+                        Some((from.join(", "), states, feats))
+                    });
+                    let inherits = inherits.map(|(from, states, feats)| view! {
+                        <div class="label">"Inherits from " {from}</div>
+                        <p class="muted small inherit">
+                            {(!feats.is_empty()).then(|| format!("Parts and attributes: {}. ", feats.join(", ")))}
+                            {(!states.is_empty()).then(|| format!("States: {} (usable on its links).", states.join(", ")))}
+                            {(feats.is_empty() && states.is_empty()).then_some("Nothing yet.")}
+                        </p>
+                    });
                     let set_semi = move |on: bool| ui.send(vec![Op::SemiFold { opd: Some(here), thing: id, on }], |_| {});
                     let semi_row = (is_obj && (has_parts || semi)).then(|| view! {
                         <div class="label">"Parts and attributes here"</div>
@@ -727,6 +746,7 @@ fn Inspector() -> impl IntoView {
                                     <button class="chip add" on:click=move |_| ui.add_state()>"+ state"</button>
                                 </div>
                             })}
+                            {inherits}
                             {timing}
                             {quantity}
                             {semi_row}
@@ -756,7 +776,9 @@ fn Inspector() -> impl IntoView {
                             <div class="seg">
                                 <button class:on=s.initial title="The state it starts in" on:click={let v = !s.initial; move |_| ui.send(vec![Op::SetState { id: sid, initial: Some(v), final_: None }], |_| {})}>"Initial"</button>
                                 <button class:on=s.final_ title="A state it ends in" on:click={let v = !s.final_; move |_| ui.send(vec![Op::SetState { id: sid, initial: None, final_: Some(v) }], |_| {})}>"Final"</button>
+                                <button class:on=s.default_ title="The state it gets when a process yields it without saying which" on:click={let v = !s.default_; move |_| ui.send(vec![Op::SetDefaultState { id: sid, default: v }], |_| {})}>"Default"</button>
                             </div>
+                            {s.inherited.then(|| view! { <p class="muted small">"Inherited: it belongs to what this object specializes."</p> })}
                             <p class="muted small">"Drag from a state to a process to make the link state-specific."</p>
                             <button class="danger" on:click=move |_| ui.remove_selected()>"Delete state"</button>
                         </section>
@@ -810,8 +832,15 @@ fn Inspector() -> impl IntoView {
                                 {opt(Modifier::None, "Normal", "Always part of the process")}
                                 {opt(Modifier::Condition, "Condition (c)", "The process runs only if this object exists (in that state); otherwise it is skipped")}
                                 {opt(Modifier::Event, "Event (e)", "This object appearing (in that state) starts the process")}
+                                {matches!(l.kind, LinkKind::Agent | LinkKind::Instrument).then(|| opt(Modifier::NotCondition, "Unless (¬c)", "The process runs only if this object does NOT exist (in that state); otherwise it is skipped"))}
                             </div>
                         }
+                    });
+                    let path = l.kind.is_procedural().then(|| view! {
+                        <label class="label">"Path"</label>
+                        <input class="field-input" placeholder="none (e.g. a): pairs this input with the outputs labeled alike"
+                            prop:value=l.path.clone()
+                            on:change=move |e| ui.send(vec![Op::SetPath { id: lid, path: event_target_value(&e) }], |_| {}) />
                     });
                     let count = l.countable().then(|| view! {
                         <label class="label">"Multiplicity"</label>
@@ -885,6 +914,7 @@ fn Inspector() -> impl IntoView {
                             {route}
                             {pickers}
                             {modifier}
+                            {path}
                             {count}
                             {alternatives}
                             <button class="danger" on:click=move |_| ui.remove_selected()>"Delete link"</button>

@@ -89,6 +89,7 @@ pub fn export(m: &Model) -> String {
                 match l.modifier {
                     Modifier::Condition => note.push("condition: skipped if absent".into()),
                     Modifier::Event => note.push("event: starts the action".into()),
+                    Modifier::NotCondition => note.push("negated condition: skipped if present".into()),
                     Modifier::None => {}
                 }
                 let st = |s: Option<Id>| s.and_then(|s| m.state(s)).map(|(_, s)| s.name.clone());

@@ -150,7 +150,9 @@ pub fn render(m: &Model) -> Vec<Sentence> {
         if let Some(d) = t.duration.as_ref().and_then(duration_text) {
             out.push(Sentence { text: format!("{} takes {d}.", t.name), refs: vec![t.id] });
         }
-        match (t.states.as_slice(), owner) {
+        // Inherited states belong to the general's sentence.
+        let own: Vec<crate::State> = t.states.iter().filter(|s| !s.inherited).cloned().collect();
+        match (own.as_slice(), owner) {
             ([], _) => {}
             (ss, _) if t.more_states => {
                 let names: Vec<_> = ss.iter().map(|s| s.name.clone()).chain(["other states".to_string()]).collect();
@@ -163,11 +165,14 @@ pub fn render(m: &Model) -> Vec<Sentence> {
                 out.push(Sentence { text: format!("{} can be {}.", t.name, list(&names, "or")), refs: vec![t.id] });
             }
         }
-        for s in &t.states {
-            let what = match (s.initial, s.final_) {
-                (true, true) => "initial and final",
-                (true, false) => "initial",
-                (false, true) => "final",
+        for s in t.states.iter().filter(|s| !s.inherited) {
+            let what = match (s.initial, s.final_, s.default_) {
+                (true, true, _) => "initial and final",
+                (true, false, true) => "initial and default",
+                (true, false, false) => "initial",
+                (false, true, true) => "final and default",
+                (false, true, false) => "final",
+                (false, false, true) => "default",
                 _ => continue,
             };
             out.push(Sentence { text: format!("State {} of {} is {what}.", s.name, t.name), refs: vec![t.id] });
@@ -265,6 +270,10 @@ pub fn render(m: &Model) -> Vec<Sentence> {
             Some(s) => format!("{o} is {s}"),
             None => format!("{o} exists"),
         };
+        let not_cond = match &input {
+            Some(s) => format!("{o} is not {s}"),
+            None => format!("{o} does not exist"),
+        };
         let text = match (&l.kind, l.modifier) {
             (LinkKind::Generalization, _) => format!("{t} is {} {f}.", article(&f)),
             (LinkKind::Classification, _) => format!("{t} is an instance of {f}."),
@@ -285,9 +294,12 @@ pub fn render(m: &Model) -> Vec<Sentence> {
             (LinkKind::Agent, Modifier::Condition) => format!("{p} occurs if {cond}, in which case {o} handles {p}, otherwise {p} is skipped."),
             (LinkKind::Instrument, Modifier::Condition) => format!("{p} occurs if {cond}, otherwise {p} is skipped."),
             (_, Modifier::Condition) => format!("{p} occurs if {cond}, in which case {p} {pred}, otherwise {p} is skipped."),
+            (_, Modifier::NotCondition) => format!("{p} occurs if {not_cond}, otherwise {p} is skipped."),
             (_, Modifier::Event) => format!("{} initiates {p}, which {pred}.", capitalize(&obj(input))),
             (_, Modifier::None) => format!("{p} {pred}."),
         };
+        // Path label: "Following path a, Sorting yields Good Part."
+        let text = if l.path.is_empty() { text } else { format!("Following path {}, {text}", l.path) };
         out.push(Sentence { text, refs: vec![l.from, l.id, l.to] });
     }
     // Semi-folded wholes whose parts are all folded (no structural link drawn here).

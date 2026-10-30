@@ -719,3 +719,92 @@ fn time_values_loops_and_chances() {
     assert!(sim.blocked && sim.log.last().unwrap().contains("loop never ends"));
     m.validate().unwrap();
 }
+
+#[test]
+fn negation_paths_defaults_and_inheritance() {
+    use opm_core::{sim::Sim, Modifier};
+    let mut m = Model::new("Shop");
+    let at = |m: &mut Model, name: &str, kind: Kind, y: f64| {
+        m.apply(Op::AddThing { name: name.into(), kind, essence: Essence::Informatical, affiliation: Default::default(), opd: None, x: Some(0.0), y: Some(y), inside: None }).unwrap()
+    };
+    // Inheritance: Sedan is a Car; it inherits Car's parts and states.
+    let car = at(&mut m, "Car", Kind::Object, 0.0);
+    let sedan = at(&mut m, "Sedan", Kind::Object, 0.0);
+    let engine = at(&mut m, "Engine", Kind::Object, 0.0);
+    let dirty = m.apply(Op::AddState { thing: car, name: "dirty".into() }).unwrap();
+    let clean = m.apply(Op::AddState { thing: car, name: "clean".into() }).unwrap();
+    link(&mut m, car, sedan, LinkKind::Generalization).unwrap();
+    link(&mut m, car, engine, LinkKind::Aggregation).unwrap();
+    assert!(link(&mut m, sedan, car, LinkKind::Generalization).is_err(), "no circles");
+    assert_eq!(m.ancestors(sedan), vec![car]);
+    assert_eq!(m.inherited_features(sedan).len(), 1);
+    let scrapping = at(&mut m, "Scrapping", Kind::Process, 100.0);
+    let washing = at(&mut m, "Washing", Kind::Process, 200.0);
+    link(&mut m, car, scrapping, LinkKind::Consumption).unwrap();
+    // Washing changes the Sedan using Car's states.
+    m.apply(Op::AddLink { from: sedan, to: washing, kind: LinkKind::Effect, from_state: Some(dirty), to_state: Some(clean) }).unwrap();
+    let v = m.view(m.root());
+    let s = v.thing(sedan).unwrap();
+    assert!(s.states.iter().all(|x| x.inherited) && s.states.len() == 2, "inherited states drawn where used");
+
+    // Negated condition: Alarming happens only if there is no Fault.
+    let alarming = at(&mut m, "Alarming", Kind::Process, 300.0);
+    let fault = at(&mut m, "Fault", Kind::Object, 0.0);
+    let log_ = at(&mut m, "Alarm Log", Kind::Object, 0.0);
+    let n = link(&mut m, fault, alarming, LinkKind::Instrument).unwrap();
+    m.apply(Op::SetLink { id: n, states: None, modifier: Some(Modifier::NotCondition), multiplicity: None }).unwrap();
+    link(&mut m, alarming, log_, LinkKind::Result).unwrap();
+    let c = link(&mut m, fault, scrapping, LinkKind::Agent);
+    assert!(c.is_ok());
+    let cons = m.links.iter().find(|l| l.from == car && l.to == scrapping).unwrap().id;
+    assert!(m.apply(Op::SetLink { id: cons, states: None, modifier: Some(Modifier::NotCondition), multiplicity: None }).is_err(), "agent/instrument only");
+
+    // Paths: Sorting takes Raw Part to Good Part (path a) or Scrap to Waste (path b).
+    let sorting = at(&mut m, "Sorting", Kind::Process, 400.0);
+    let cutting = at(&mut m, "Cutting", Kind::Process, 500.0);
+    let raw = at(&mut m, "Raw Part", Kind::Object, 0.0);
+    let scrap = at(&mut m, "Scrap", Kind::Object, 0.0);
+    let good = at(&mut m, "Good Part", Kind::Object, 0.0);
+    let waste = at(&mut m, "Waste", Kind::Object, 0.0);
+    let old = m.apply(Op::AddState { thing: good, name: "fresh".into() }).and_then(|_| m.apply(Op::AddState { thing: good, name: "old".into() })).unwrap();
+    m.apply(Op::SetDefaultState { id: old, default: true }).unwrap();
+    for (from, to, kind, path) in [(raw, sorting, LinkKind::Consumption, "a"), (sorting, good, LinkKind::Result, "a"), (scrap, sorting, LinkKind::Consumption, "b"), (sorting, waste, LinkKind::Result, "b")] {
+        let id = link(&mut m, from, to, kind).unwrap();
+        m.apply(Op::SetPath { id, path: path.into() }).unwrap();
+    }
+    link(&mut m, cutting, scrap, LinkKind::Result).unwrap();
+    assert!(m.apply(Op::SetPath { id: n, path: "x".into() }).is_ok());
+    m.apply(Op::SetPath { id: n, path: "".into() }).unwrap();
+
+    let opl: Vec<_> = opl::render(&m.view(m.root())).into_iter().map(|s| s.text).collect();
+    for s in ["Alarming occurs if Fault does not exist, otherwise Alarming is skipped.", "Following path a, Sorting consumes Raw Part.", "Following path b, Sorting yields Waste.", "State old of Good Part is default.", "Washing changes Sedan from dirty to clean."] {
+        assert!(opl.contains(&s.to_string()), "missing '{s}' in {opl:?}");
+    }
+
+    let mut sim = Sim::new(&m, m.root());
+    while sim.step(&m) {}
+    let log = sim.log.join("\n");
+    assert!(log.contains("Scrapping consumed Car"), "{log}");
+    assert!(log.contains("Washing changed Sedan from dirty to clean"), "a Sedan stands in for a Car: {log}");
+    assert!(log.contains("Alarming skipped: Fault is there"), "{log}");
+    assert!(log.contains("Sorting following path a, consumed Raw Part, yielded Good Part (old)") || log.contains("Sorting following path a, consumed Raw Part, yielded Good Part"), "{log}");
+    assert!(!log.contains("Waste") && !log.contains("consumed Scrap"), "{log}");
+    assert_eq!(sim.exists.get(&good), Some(&Some(old)), "yielded in its default state");
+    let _ = (engine, clean);
+    m.validate().unwrap();
+}
+
+#[test]
+fn inherited_states_stay_out_of_the_specializations_opl() {
+    let mut m = Model::new("t");
+    let car = add(&mut m, "Car", Kind::Object);
+    let sedan = add(&mut m, "Sedan", Kind::Object);
+    let washing = add(&mut m, "Washing", Kind::Process);
+    let a = m.apply(Op::AddState { thing: car, name: "dirty".into() }).unwrap();
+    let b = m.apply(Op::AddState { thing: car, name: "clean".into() }).unwrap();
+    link(&mut m, car, sedan, LinkKind::Generalization).unwrap();
+    m.apply(Op::AddLink { from: sedan, to: washing, kind: LinkKind::Effect, from_state: Some(a), to_state: Some(b) }).unwrap();
+    let opl: Vec<_> = opl::render(&m.view(m.root())).into_iter().map(|s| s.text).collect();
+    assert!(!opl.iter().any(|s| s.starts_with("Sedan can be")), "{opl:?}");
+    assert!(opl.contains(&"Car can be dirty or clean.".to_string()));
+}

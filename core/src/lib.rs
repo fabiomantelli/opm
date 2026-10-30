@@ -46,6 +46,12 @@ pub struct State {
     /// A state the object ends in (drawn with a double border).
     #[serde(default, rename = "final", skip_serializing_if = "std::ops::Not::not")]
     pub final_: bool,
+    /// The state the object is in when a process yields it without saying which (drawn with a small arrow).
+    #[serde(default, rename = "default", skip_serializing_if = "std::ops::Not::not")]
+    pub default_: bool,
+    /// In a diagram view: a state of a generalization, drawn on this specialization because a link uses it.
+    #[serde(default, skip_serializing)]
+    pub inherited: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -252,6 +258,9 @@ pub enum Modifier {
     Condition,
     /// The object appearing (in that state) starts the process.
     Event,
+    /// Negated condition: the process happens only if the object does *not* exist (in that state);
+    /// otherwise it is skipped. Agent and instrument links only.
+    NotCondition,
 }
 
 impl Modifier {
@@ -283,6 +292,10 @@ pub struct Link {
     /// Among XOR/OR alternatives: how likely this one is (0..1). None = as likely as the others.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probability: Option<f64>,
+    /// Path label: of a process's links, the inputs and outputs with the same label go together
+    /// ("following path a, Sorting consumes Part and yields Good Part").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
 }
 
 impl Link {
@@ -499,6 +512,10 @@ pub enum Op {
         #[serde(default)]
         measure: Option<Measure>,
     },
+    /// Makes a state its object's default one (or not): the state it gets when yielded without one.
+    SetDefaultState { id: Id, default: bool },
+    /// Sets a link's path label (empty: none).
+    SetPath { id: Id, path: String },
     /// Sets (or clears) how likely a link is among its XOR/OR alternatives, 0..1.
     SetProbability {
         id: Id,
@@ -701,6 +718,49 @@ impl Model {
             .collect()
     }
 
+    /// What `id` specializes, nearest first: it inherits their parts, attributes, states and links.
+    pub fn ancestors(&self, id: Id) -> Vec<Id> {
+        let mut out: Vec<Id> = vec![];
+        let mut todo = vec![id];
+        while let Some(x) = todo.pop() {
+            for l in self.links.iter().filter(|l| l.to == x && l.kind == LinkKind::Generalization) {
+                if l.from != id && !out.contains(&l.from) {
+                    out.push(l.from);
+                    todo.insert(0, l.from);
+                }
+            }
+        }
+        out
+    }
+
+    /// Its specializations, at any depth.
+    pub fn descendants(&self, id: Id) -> Vec<Id> {
+        let mut out: Vec<Id> = vec![];
+        let mut todo = vec![id];
+        while let Some(x) = todo.pop() {
+            for l in self.links.iter().filter(|l| l.from == x && l.kind == LinkKind::Generalization) {
+                if l.to != id && !out.contains(&l.to) {
+                    out.push(l.to);
+                    todo.push(l.to);
+                }
+            }
+        }
+        out
+    }
+
+    /// Its own states, then those it inherits.
+    pub fn all_states(&self, id: Id) -> Vec<&State> {
+        std::iter::once(id).chain(self.ancestors(id)).filter_map(|x| self.thing(x)).flat_map(|t| &t.states).collect()
+    }
+
+    /// Structural links it inherits (parts, attributes) from what it specializes: (owner, link).
+    pub fn inherited_features(&self, id: Id) -> Vec<(Id, &Link)> {
+        self.ancestors(id)
+            .into_iter()
+            .flat_map(|a| self.links.iter().filter(move |l| l.from == a && matches!(l.kind, LinkKind::Aggregation | LinkKind::Exhibition)).map(move |l| (a, l)))
+            .collect()
+    }
+
     /// Things inside the in-zoomed process of `opd`.
     pub fn inner(&self, opd: Id) -> Vec<Id> {
         self.opd(opd).map(|o| o.shows.iter().filter(|s| s.inside).map(|s| s.thing).collect()).unwrap_or_default()
@@ -749,6 +809,26 @@ impl Model {
         }
         // Suppressed states (kept while a link here uses them) and semi-folded parts.
         let used: HashSet<Id> = v.links.iter().flat_map(|l| [l.from_state, l.to_state]).flatten().collect();
+        let inherit: Vec<(Id, Vec<State>)> = v
+            .things
+            .iter()
+            .map(|t| {
+                let own: Vec<Id> = t.states.iter().map(|s| s.id).collect();
+                let got: Vec<State> = self
+                    .all_states(t.id)
+                    .into_iter()
+                    .filter(|s| !own.contains(&s.id) && used.contains(&s.id))
+                    .map(|s| State { inherited: true, ..s.clone() })
+                    .collect();
+                (t.id, got)
+            })
+            .filter(|(_, g)| !g.is_empty())
+            .collect();
+        for (id, got) in inherit {
+            if let Some(t) = v.things.iter_mut().find(|t| t.id == id) {
+                t.states.extend(got);
+            }
+        }
         for t in &mut v.things {
             let n = t.states.len();
             t.states.retain(|s| !o.hidden_states.contains(&s.id) || used.contains(&s.id));
@@ -1138,7 +1218,7 @@ impl Model {
                     return Err(format!("invalid or duplicate state '{name}'"));
                 }
                 let id = self.fresh();
-                self.things.iter_mut().find(|t| t.id == thing).unwrap().states.push(State { id, name, initial: false, final_: false });
+                self.things.iter_mut().find(|t| t.id == thing).unwrap().states.push(State { id, name, initial: false, final_: false, default_: false, inherited: false });
                 Ok(id)
             }
             Op::AddLink { from, to, kind, from_state, to_state } => {
@@ -1161,16 +1241,19 @@ impl Model {
                         _ => return Err("states only apply to procedural links between an object and a process".into()),
                     };
                     for s in [from_state, to_state].into_iter().flatten() {
-                        if !obj.states.iter().any(|st| st.id == s) {
-                            return Err(format!("state {s} does not belong to '{}'", obj.name));
+                        if !self.all_states(obj.id).iter().any(|st| st.id == s) {
+                            return Err(format!("state {s} does not belong to '{}' or what it specializes", obj.name));
                         }
                     }
+                }
+                if kind == LinkKind::Generalization && (from == to || self.ancestors(from).contains(&to)) {
+                    return Err(format!("'{}' already specializes '{}': generalizations can't go in a circle", f.name, t.name));
                 }
                 if self.links.iter().any(|l| l.from == from && l.to == to && l.kind == kind) {
                     return Err("link already exists".into());
                 }
                 let id = self.fresh();
-                self.links.push(Link { id, from, to, kind, from_state, to_state, modifier: Modifier::None, multiplicity: String::new(), route: None, probability: None });
+                self.links.push(Link { id, from, to, kind, from_state, to_state, modifier: Modifier::None, multiplicity: String::new(), route: None, probability: None, path: String::new() });
                 Ok(id)
             }
             Op::Rename { id, name } => {
@@ -1217,12 +1300,15 @@ impl Model {
                         (Kind::Process, Kind::Object) => t,
                         _ => return Err("states only apply to links between an object and a process".into()),
                     };
-                    if [a, b].into_iter().flatten().any(|s| !obj.states.iter().any(|x| x.id == s)) {
+                    if [a, b].into_iter().flatten().any(|s| !self.all_states(obj.id).iter().any(|x| x.id == s)) {
                         return Err(format!("that state does not belong to '{}'", obj.name));
                     }
                 }
                 if modifier.is_some_and(|m| !m.is_none()) && !l.modifiable() {
                     return Err("only agent, instrument, consumption and effect links can be conditions or events".into());
+                }
+                if modifier == Some(Modifier::NotCondition) && !matches!(l.kind, LinkKind::Agent | LinkKind::Instrument) {
+                    return Err("a negated condition goes on an agent or instrument link".into());
                 }
                 let multiplicity = multiplicity.map(|m| m.trim().replace(' ', ""));
                 if let Some(m) = multiplicity.as_deref().filter(|m| !m.is_empty()) {
@@ -1360,6 +1446,21 @@ impl Model {
                 }
                 let measure = measure.map(|m| Measure { unit: m.unit.trim().to_string(), ..m });
                 self.things.iter_mut().find(|t| t.id == id).unwrap().measure = measure;
+                Ok(id)
+            }
+            Op::SetDefaultState { id, default } => {
+                let t = self.things.iter_mut().find(|t| t.states.iter().any(|s| s.id == id)).ok_or("no such state")?;
+                for s in &mut t.states {
+                    s.default_ = default && s.id == id;
+                }
+                Ok(id)
+            }
+            Op::SetPath { id, path } => {
+                let l = self.links.iter_mut().find(|l| l.id == id).ok_or("no such link")?;
+                if !l.kind.is_procedural() {
+                    return Err("path labels go on procedural links".into());
+                }
+                l.path = path.trim().to_string();
                 Ok(id)
             }
             Op::SetProbability { id, probability } => {

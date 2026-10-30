@@ -975,6 +975,7 @@ fn link_view(l: &Link, ends: &Ends, g: &LinkGeo, cls: &str, style: LinkStyle) ->
     let letter = match l.modifier {
         Modifier::Condition => Some("c"),
         Modifier::Event => Some("e"),
+        Modifier::NotCondition => Some("¬c"),
         Modifier::None => None,
     };
     let modifier = letter.zip(ends.process).and_then(|(letter, c)| {
@@ -985,7 +986,14 @@ fn link_view(l: &Link, ends: &Ends, g: &LinkGeo, cls: &str, style: LinkStyle) ->
         let (x, y) = along(&p, 20.0, -11.0);
         view! { <text class="mult" x=x y=y text-anchor="middle" dominant-baseline="central">{l.multiplicity.clone()}</text> }
     });
-    view! { <g>{lines}{deco}{modifier}{count}</g> }
+    // Path label, beside the middle of the link.
+    let path = (!l.path.is_empty()).then(|| {
+        let angle = if angle.abs() > 90.0 { angle - 180.0 } else { angle };
+        view! {
+            <text class="path-label" text-anchor="middle" transform=format!("translate({mx},{my}) rotate({angle}) translate(0,-9)")>{l.path.clone()}</text>
+        }
+    });
+    view! { <g>{lines}{deco}{modifier}{count}{path}</g> }
 }
 
 fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>, now: Option<Id>) -> AnyView {
@@ -1050,15 +1058,22 @@ fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>, now: Option<Id>) -> A
         .filter_map(|b| Some((b, t.states.iter().find(|s| s.id == b.0)?)))
         .map(|((sid, x, y, sw, sh), s)| {
             let c = format!(
-                "state{}{}{}{}",
+                "state{}{}{}{}{}",
                 if sel_state == Some(sid) { " sel" } else { "" },
                 if s.initial { " initial" } else { "" },
                 if s.final_ { " final" } else { "" },
                 if now == Some(sid) { " now" } else { "" },
+                if s.inherited { " inherited" } else { "" },
             );
+            // Default state: a small arrow pointing at it from the upper left.
+            let mark = s.default_.then(|| view! {
+                <path class="default-mark" d=format!("M{},{} L{},{} M{},{} L{},{} L{},{}", x - 9.0, y - 9.0, x + 2.0, y + 2.0, x - 3.0, y + 2.5, x + 2.0, y + 2.0, x + 2.0, y - 3.0) />
+            });
             view! {
                 <g class=c>
+                    {s.inherited.then(|| view! { <title>"Inherited from what it specializes"</title> })}
                     <rect x=x y=y width=sw height=sh rx="12" />
+                    {mark}
                     {s.final_.then(|| view! { <rect class="inner" x=x + 3.0 y=y + 3.0 width=sw - 6.0 height=sh - 6.0 rx="9" /> })}
                     <text x=x + sw / 2.0 y=y + sh / 2.0 text-anchor="middle" dominant-baseline="central">{s.name.clone()}</text>
                 </g>
@@ -1132,7 +1147,7 @@ pub fn Canvas() -> impl IntoView {
                         cls += " fresh";
                     }
                     let ss = sel_state.filter(|s| t.states.iter().any(|x| x.id == *s));
-                    let states: Vec<String> = t.states.iter().map(|s| format!("{}:{}:{}{}", s.id, s.name, s.initial, s.final_)).collect();
+                    let states: Vec<String> = t.states.iter().map(|s| format!("{}:{}:{}{}{}{}", s.id, s.name, s.initial, s.final_, s.default_, s.inherited)).collect();
                     let key = format!(
                         "{}|{}|{}|{}|{:?}|{:?}|{}|{cls}|{ss:?}|{now:?}|{:?}|{:?}|{:?}|{}|{:?}",
                         t.id,

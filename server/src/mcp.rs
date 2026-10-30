@@ -64,6 +64,11 @@ Time and quantities (use them whenever the system has timing or sizing requireme
   or shorter than its min ('If Publishing lasts more than 20 ms, Alarming occurs').
 - value / min_value / max_value / unit on an object, usually an attribute: 'Latency of Message is 20 ms (allowed: at most
   50 ms)'. A value outside its range shows up in the checks.
+More control: modifier 'not_condition' (agent/instrument) runs the process only if the object is NOT there (in
+from_state). path='a' on a process's links pairs inputs with outputs: following path a it consumes X and yields Y,
+following path b it consumes Z and yields W. default_state in add_things: the state an object gets when yielded
+without one. Generalization is inherited: a specialization has its general's parts, attributes and states (links can
+use the general's states on it), and wherever a process needs the general, a specialization will do.
 Loops: an invocation from a process to itself (or to an earlier step) repeats it; give it a condition link that stops
 being true, or it never ends. Alternatives (fan xor/or) can carry probability (0..1) on each link.
 Verify behavior with simulate(diagram): it runs the diagram's processes top to bottom (level ones in parallel), follows
@@ -164,6 +169,9 @@ pub struct ThingSpec {
     /// States it ends in.
     #[serde(default)]
     final_states: Vec<String>,
+    /// The state it gets when a process yields it without saying which.
+    #[serde(default)]
+    default_state: Option<String>,
     /// In an in-zoom diagram: the subprocess this one runs in parallel with (drawn level with it).
     #[serde(default)]
     parallel_with: Option<String>,
@@ -228,7 +236,7 @@ pub struct LinkSpec {
     /// Phrase for tagged links, e.g. "is connected to".
     #[serde(default)]
     tag: Option<String>,
-    /// "condition" or "event" (agent/instrument/consumption/effect only).
+    /// "condition" or "event" (agent/instrument/consumption/effect), or "not_condition" (agent/instrument).
     #[serde(default)]
     modifier: Option<String>,
     /// How many of the object/part end: "4", "0..1", "1..*", "2..5", "*".
@@ -237,6 +245,9 @@ pub struct LinkSpec {
     /// Among XOR/OR alternatives (see fan): how likely this one is, 0..1.
     #[serde(default)]
     probability: Option<f64>,
+    /// Path label pairing a process's inputs with its outputs ('a', 'b').
+    #[serde(default)]
+    path: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -345,7 +356,8 @@ fn modifier(s: &Option<String>) -> Result<Option<Modifier>, String> {
         Some(s) if s.is_empty() || s == "none" => Some(Modifier::None),
         Some(s) if s == "condition" => Some(Modifier::Condition),
         Some(s) if s == "event" => Some(Modifier::Event),
-        Some(other) => return Err(format!("modifier must be condition or event, got '{other}'")),
+        Some(s) if s == "not_condition" || s == "not condition" || s == "unless" => Some(Modifier::NotCondition),
+        Some(other) => return Err(format!("modifier must be condition, event or not_condition, got '{other}'")),
     })
 }
 
@@ -357,8 +369,7 @@ fn state_id(m: &Model, a: Id, b: Id, state: &Option<String>) -> Result<Option<Id
     let Some(name) = state else { return Ok(None) };
     [a, b]
         .iter()
-        .filter_map(|&id| m.thing(id))
-        .flat_map(|t| &t.states)
+        .flat_map(|&id| m.all_states(id))
         .find(|s| s.name.eq_ignore_ascii_case(name.trim()))
         .map(|s| Some(s.id))
         .ok_or_else(|| format!("no state '{name}' on the linked object"))
@@ -453,6 +464,11 @@ impl Mcp {
                     let (i, f) = if initial { (Some(true), None) } else { (None, Some(true)) };
                     m.apply(Op::SetState { id: sid, initial: i, final_: f })?;
                 }
+                if let Some(d) = &t.default_state {
+                    let sid = m.thing(id).unwrap().states.iter().find(|x| x.name.eq_ignore_ascii_case(d.trim())).map(|x| x.id);
+                    let sid = sid.ok_or_else(|| format!("'{}' has no state '{d}'", t.name))?;
+                    m.apply(Op::SetDefaultState { id: sid, default: true })?;
+                }
                 if let Some(keep) = &t.show_states {
                     let states = m.thing(id).unwrap().states.clone();
                     if let Some(bad) = keep.iter().find(|k| !states.iter().any(|s| s.name.eq_ignore_ascii_case(k.trim()))) {
@@ -523,6 +539,9 @@ impl Mcp {
                     to_state: state_id(m, from, to, &l.to_state)?,
                 };
                 let id = m.apply(op).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
+                if let Some(path) = &l.path {
+                    m.apply(Op::SetPath { id, path: path.clone() }).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
+                }
                 if l.probability.is_some() {
                     m.apply(Op::SetProbability { id, probability: l.probability }).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
                 }

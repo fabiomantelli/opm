@@ -453,3 +453,9 @@ select.chip.add { appearance: none; cursor: pointer; }
 .qty-row { display: grid; grid-template-columns: repeat(3, 1fr) 70px; gap: 6px; }
 .qty-row .field-input { padding: 6px; min-width: 0; }
 .sim-clock { font-variant-numeric: tabular-nums; font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--accent-soft); }
+
+/* Negation, paths, default and inherited states */
+.path-label { font-size: 12px; font-style: italic; fill: var(--accent); }
+.default-mark { fill: none; stroke: var(--ink); stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.state.inherited rect { stroke-dasharray: 4 3; }
+.state.inherited text { font-style: italic; }

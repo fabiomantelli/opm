@@ -122,6 +122,20 @@ mudou em todos os diagramas que o mostram.
 - **Simular** agora soma o tempo (paralelos contam o mais lento), mostra *t = …*, segue invocações e laços,
   dispara as exceções e sorteia os ramos pelas chances (cada *Reset* sorteia de novo).
 
+## Mais controle e herança
+
+- **Condição negada** (*Unless (¬c)* no painel de uma ligação agent/instrument): o processo só roda se o
+  objeto **não** estiver lá (naquele estado). OPL: *"Alarming occurs if Fault does not exist, otherwise
+  Alarming is skipped."*
+- **Caminhos** (campo *Path* da ligação): entradas e saídas com o mesmo rótulo andam juntas — *"Following
+  path a, Sorting consumes Raw Part"* / *"Following path a, Sorting yields Good Part"*. Na simulação o
+  processo segue o primeiro caminho cujas entradas estão presentes e ignora os outros.
+- **Estado padrão** (botão *Default* no painel do estado, seta pequena no desenho): o estado que o objeto
+  ganha quando um processo o gera sem dizer qual. *Initial* continua sendo o estado no começo.
+- **Herança**: uma especialização (*Sedan is a Car*) herda partes, atributos e estados do geral. O painel
+  mostra o que ela herda; ligações podem usar os estados do geral nela (aparecem tracejados), e onde um
+  processo pede um Car, um Sedan serve na simulação. Generalização em círculo é recusada.
+
 ## Requisitos e rastreabilidade
 
 Painel **Requirements**: escreva o requisito e `Enter` (ganha a chave `REQ-1`, `REQ-2`…; clique na chave ou
@@ -207,7 +221,7 @@ arrastar à mão ficam onde você deixou; dali em diante a IA só encaixa os ite
 `T` (Tidy) reorganiza tudo e devolve o layout ao modo automático.
 
 Ferramentas que o ChatGPT recebe: `list_models`, `create_model`, `add_things` (num diagrama: `diagram="SD1"`),
-`add_links` (com `modifier` condition/event e `multiplicity`), `fan` (agrupa ligações em XOR/OR), `add_requirements` (cria e rastreia requisitos), `simulate` (roda um diagrama e devolve o registro), `export_sysml`, `zoom_in` e `unfold` (criam diagramas de detalhe; em `add_things`, `parallel_with` põe um subprocesso em paralelo com outro), `group` (out-zoom: agrupa processos num processo novo), e em `add_things` também `show_states` (supressão), `semi_fold`, `duration` e `value`/`min_value`/`max_value`/`unit`; ligações `overtime`/`undertime` e `probability`, `remove` (do modelo, ou só de um diagrama),
+`add_links` (com `modifier` condition/event e `multiplicity`), `fan` (agrupa ligações em XOR/OR), `add_requirements` (cria e rastreia requisitos), `simulate` (roda um diagrama e devolve o registro), `export_sysml`, `zoom_in` e `unfold` (criam diagramas de detalhe; em `add_things`, `parallel_with` põe um subprocesso em paralelo com outro), `group` (out-zoom: agrupa processos num processo novo), e em `add_things` também `show_states` (supressão), `semi_fold`, `duration` e `value`/`min_value`/`max_value`/`unit`; ligações `overtime`/`undertime`, `probability`, `path` e o modificador `not_condition`, e `default_state` nos itens, `remove` (do modelo, ou só de um diagrama),
 `arrange` (reorganiza um diagrama inteiro) e `get_model` (árvore de diagramas, OPL de cada um e os checks).
 O guia que a IA recebe pede para nunca omitir itens para "caber": diagramas grandes viram refinamentos.
 
