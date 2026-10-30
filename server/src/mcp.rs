@@ -255,7 +255,7 @@ impl Mcp {
 
     #[tool(description = "Add objects and processes (with optional states) to a diagram (default SD). Existing names are shown in that diagram too and only get the missing states. All-or-nothing.")]
     async fn add_things(&self, Parameters(p): Parameters<AddThings>) -> Result<String, String> {
-        self.app.edit(&p.model, |m| {
+        self.app.edit(&p.model, "AI", |m| {
             let opd = diagram(m, &p.diagram)?;
             let mut touched = vec![];
             for t in p.things {
@@ -295,7 +295,7 @@ impl Mcp {
 
     #[tool(description = "Add links between things by name. Links belong to the model and show in every diagram that shows both ends; linking an outside thing to a subprocess shows it in that in-zoom diagram. Invalid kinds are rejected with the allowed list. All-or-nothing.")]
     async fn add_links(&self, Parameters(p): Parameters<AddLinks>) -> Result<String, String> {
-        self.app.edit(&p.model, |m| {
+        self.app.edit(&p.model, "AI", |m| {
             let mut touched = vec![];
             for l in p.links {
                 let (from, to) = (thing_id(m, &l.from)?, thing_id(m, &l.to)?);
@@ -324,7 +324,7 @@ impl Mcp {
 
     #[tool(description = "Open a detail diagram for a process (in-zooming): its subprocesses go inside it, in time order. Returns the diagram label to pass as `diagram` to add_things. Reuses the existing one if any.")]
     async fn zoom_in(&self, Parameters(p): Parameters<ThingRef>) -> Result<String, String> {
-        self.app.edit(&p.model, |m| {
+        self.app.edit(&p.model, "AI", |m| {
             let id = thing_id(m, &p.thing)?;
             let opd = m.apply(Op::Refine { thing: id, unfold: false, from: None })?;
             Ok(format!("{} — add subprocesses with add_things(diagram='{}')\n\n{}", m.title(opd), m.label(opd), summary(&p.model, m)))
@@ -333,7 +333,7 @@ impl Mcp {
 
     #[tool(description = "Open a detail diagram showing a thing's parts, attributes and specializations (unfolding). Returns the diagram label.")]
     async fn unfold(&self, Parameters(p): Parameters<ThingRef>) -> Result<String, String> {
-        self.app.edit(&p.model, |m| {
+        self.app.edit(&p.model, "AI", |m| {
             let id = thing_id(m, &p.thing)?;
             let opd = m.apply(Op::Refine { thing: id, unfold: true, from: None })?;
             Ok(format!("{} — add parts with add_things(diagram='{}') and aggregation/exhibition links\n\n{}", m.title(opd), m.label(opd), summary(&p.model, m)))
@@ -342,7 +342,7 @@ impl Mcp {
 
     #[tool(description = "Remove things (from the whole model, or only from one diagram with from_diagram) and/or specific links, by name.")]
     async fn remove(&self, Parameters(p): Parameters<Remove>) -> Result<String, String> {
-        self.app.edit(&p.model, |m| {
+        self.app.edit(&p.model, "AI", |m| {
             for l in p.links {
                 let (from, to, kind) = (thing_id(m, &l.from)?, thing_id(m, &l.to)?, link_kind(&l.kind, l.tag)?);
                 let id = m
@@ -368,7 +368,7 @@ impl Mcp {
 
     #[tool(description = "Re-lay a WHOLE diagram (default SD), discarding the user's manual positions there. Layout is already automatic after every change: only call this when the user asks to reorganize.")]
     async fn arrange(&self, Parameters(p): Parameters<DiagramRef>) -> Result<String, String> {
-        self.app.edit(&p.model, |m| {
+        self.app.edit(&p.model, "AI", |m| {
             let opd = diagram(m, &p.diagram)?;
             for (id, x, y) in opm_core::layout::tidy_opd(m, opd) {
                 m.apply(Op::Move { opd: Some(opd), id, x, y, auto: true })?;

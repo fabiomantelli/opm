@@ -69,12 +69,20 @@ mudou em todos os diagramas que o mostram.
 No botão **⋯** ao lado do nome do modelo:
 
 - **Rename…** – muda o nome (o endereço `#id` continua o mesmo).
+- **Versions…** – histórico do modelo: cada mudança gera uma versão, marcada com quem fez (*You*, *AI*,
+  *Restored*…). Mudanças seguidas da mesma origem em até 2 minutos viram uma versão só. **Restore** volta a
+  qualquer uma; o restore vira uma versão nova, então também dá para desfazê-lo. É assim que se desfaz o que
+  o ChatGPT fez. Ficam as 300 versões mais recentes, em `data/.history/<modelo>/`.
 - **Export JSON** – baixa o modelo completo (todos os diagramas), para guardar ou reusar em outro PC.
 - **Export SVG / PNG** – imagem do diagrama na tela (sem seleção nem pontinhos), com as cores do tema atual; PNG em 2x.
 - **Import JSON…** – também dá para arrastar um `.json` exportado para qualquer lugar da página, ou usar
   *Import…* na tela inicial. Vira um modelo novo; se o nome já existir, ganha "(2)".
 - **Delete model…** – pede confirmação e move o arquivo para `data/.trash/`. Para recuperar: mova o arquivo
-  de volta para `data/` (tirando o sufixo numérico do nome) e reinicie o servidor.
+  de volta para `data/` (tirando o sufixo numérico do nome) e reinicie o servidor. O histórico vai junto
+  (pasta `…-history`).
+
+Os arquivos são gravados de forma segura (num temporário que depois substitui o original): se o PC desligar
+no meio, o modelo antigo continua inteiro.
 
 Esses recursos só funcionam no editor (`localhost`). Pelo MCP, a IA pode apagar itens de um modelo, mas não
 pode apagar modelos inteiros.

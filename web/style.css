@@ -364,3 +364,13 @@ kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5p
 .picker-list button { display: flex; align-items: center; gap: 8px; text-align: left; border: 0; background: transparent; border-radius: 8px; padding: 7px 8px; color: var(--ink); width: auto; height: auto; }
 .picker-list button:hover { background: var(--accent-soft); }
 .toolbar { position: relative; }
+
+/* versions */
+.versions { max-height: 50vh; overflow-y: auto; margin-top: 10px; border: 1px solid var(--line); border-radius: 10px; }
+.version { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.version:last-child { border-bottom: 0; }
+.version .when { font-variant-numeric: tabular-nums; }
+.version .by { font-size: 12px; padding: 1px 8px; border-radius: 99px; background: var(--bg); border: 1px solid var(--line); }
+.version .by-ai { color: var(--accent); border-color: var(--accent); }
+.version .spacer { flex: 1; }
+.versions > .muted { padding: 10px; margin: 0; }

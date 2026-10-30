@@ -889,7 +889,75 @@ fn ChatGptModal() -> impl IntoView {
 #[derive(Clone, Copy, PartialEq)]
 enum Dialog {
     Rename,
+    Versions,
     Delete,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct Version {
+    at: u64,
+    by: String,
+}
+
+/// "Oct 30, 14:32" in the browser's locale.
+fn when(at: u64) -> String {
+    let d = web_sys::js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(at as f64));
+    let opts = web_sys::js_sys::Object::new();
+    for (k, v) in [("month", "short"), ("day", "numeric"), ("hour", "2-digit"), ("minute", "2-digit")] {
+        let _ = web_sys::js_sys::Reflect::set(&opts, &k.into(), &v.into());
+    }
+    d.to_locale_string("default", &opts).into()
+}
+
+/// Every saved state of the model, newest first, by whoever made it; any one can be put back.
+#[component]
+fn Versions(dialog: RwSignal<Option<Dialog>>) -> impl IntoView {
+    let ui = ui();
+    let list = RwSignal::new(None::<Result<Vec<Version>, String>>);
+    let mid = move || ui.mid.get_untracked().unwrap_or_default();
+    spawn_local(async move { list.set(Some(fetch_json(Request::get(&format!("/api/models/{}/versions", mid())).build()).await)) });
+    let restore = move |at: u64| {
+        let mid = mid();
+        spawn_local(async move {
+            match Request::post(&format!("/api/models/{mid}/versions/{at}/restore")).send().await {
+                Ok(r) if r.ok() => {
+                    ui.say(format!("Restored the version from {}", when(at)));
+                    dialog.set(None);
+                }
+                Ok(r) => ui.say(r.text().await.unwrap_or_default()),
+                Err(e) => ui.say(e2s(e)),
+            }
+        });
+    };
+    view! {
+        <h2>"Versions"</h2>
+        <p class="muted">"Saved on every change, yours or the AI's. Restoring adds a new version, so it can be undone here too."</p>
+        <div class="versions">
+            {move || match list.get() {
+                None => view! { <p class="muted">"Loading…"</p> }.into_any(),
+                Some(Err(e)) => view! { <p class="muted">{e}</p> }.into_any(),
+                Some(Ok(v)) if v.is_empty() => view! { <p class="muted">"No versions yet: they start with the next change."</p> }.into_any(),
+                Some(Ok(v)) => v.into_iter().enumerate().map(|(i, ver)| {
+                    let (at, cls) = (ver.at, format!("by by-{}", ver.by.to_lowercase()));
+                    view! {
+                        <div class="version">
+                            <span class="when">{when(at)}</span>
+                            <span class=cls>{ver.by}</span>
+                            <span class="spacer"></span>
+                            {if i == 0 {
+                                view! { <span class="muted small">"current"</span> }.into_any()
+                            } else {
+                                view! { <button class="ghost-btn" on:click=move |_| restore(at)>"Restore"</button> }.into_any()
+                            }}
+                        </div>
+                    }
+                }).collect_view().into_any(),
+            }}
+        </div>
+        <div class="actions">
+            <button class="ghost-btn" on:click=move |_| dialog.set(None)>"Close"</button>
+        </div>
+    }
 }
 
 /// The "⋯" menu next to the model name: rename, export, import, delete.
@@ -913,11 +981,12 @@ fn ModelMenu() -> impl IntoView {
     };
     view! {
         <div class="model-menu">
-            <button class="ghost-btn icon" title="Model: rename, export, import, delete" on:click=move |_| open.update(|o| *o = !*o)>"⋯"</button>
+            <button class="ghost-btn icon" title="Model: rename, versions, export, import, delete" on:click=move |_| open.update(|o| *o = !*o)>"⋯"</button>
             <Show when=move || open.get()>
                 <div class="menu-catch" on:click=move |_| open.set(false)></div>
                 <div class="dropdown">
                     {item("Rename…", Box::new(move || { name.set(title()); dialog.set(Some(Dialog::Rename)) }))}
+                    {item("Versions…", Box::new(move || dialog.set(Some(Dialog::Versions))))}
                     <hr />
                     {item("Export JSON (to reuse)", Box::new(move || ui.export(Format::Json)))}
                     {item("Export SVG (image)", Box::new(move || ui.export(Format::Svg)))}
@@ -941,6 +1010,7 @@ fn ModelMenu() -> impl IntoView {
                                     </div>
                                 </form>
                             }.into_any(),
+                            Dialog::Versions => view! { <Versions dialog /> }.into_any(),
                             Dialog::Delete => view! {
                                 <h2>"Delete “" {title} "”?"</h2>
                                 <p class="muted">"It disappears from OPM Studio. The file is kept in data/.trash, so it can be recovered."</p>

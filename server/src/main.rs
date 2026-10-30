@@ -73,17 +73,77 @@ impl App {
             return Err("model name needs letters or digits".into());
         }
         if self.get(&id).is_none() {
-            self.save(&id, Model::new(name.trim()))?;
+            self.save(&id, Model::new(name.trim()), "Created")?;
         }
         Ok(id)
     }
 
     /// Runs `f` on a copy of the model; only a successful run is kept, saved and broadcast.
-    pub fn edit<T>(&self, id: &str, f: impl FnOnce(&mut Model) -> Result<T, String>) -> Result<T, String> {
+    /// `by` ("You", "AI", ...) labels the version it leaves in the history.
+    pub fn edit<T>(&self, id: &str, by: &str, f: impl FnOnce(&mut Model) -> Result<T, String>) -> Result<T, String> {
         let mut m = self.get(id).ok_or_else(|| format!("no model '{id}'"))?;
+        if self.versions(id).is_empty() {
+            // Models from before history existed: keep what they were.
+            self.snapshot(id, &m, "Earlier", false)?;
+        }
         let out = f(&mut m)?;
-        self.save(id, m)?;
+        self.save(id, m, by)?;
         Ok(out)
+    }
+
+    fn history(&self, id: &str) -> PathBuf {
+        self.dir.join(".history").join(id)
+    }
+
+    /// (unix ms, who), newest first. Files are `{ms}-{who}.json`.
+    pub fn versions(&self, id: &str) -> Vec<(u64, String)> {
+        let mut v: Vec<(u64, String)> = std::fs::read_dir(self.history(id))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let (at, by) = name.strip_suffix(".json")?.split_once('-')?;
+                Some((at.parse().ok()?, by.to_string()))
+            })
+            .collect();
+        v.sort_by(|a, b| b.cmp(a));
+        v
+    }
+
+    pub fn version(&self, id: &str, at: u64) -> Result<Model, String> {
+        let (_, by) = self.versions(id).into_iter().find(|v| v.0 == at).ok_or("no such version")?;
+        let text = std::fs::read_to_string(self.history(id).join(format!("{at}-{by}.json"))).map_err(|e| e.to_string())?;
+        let mut m: Model = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        m.normalize();
+        Ok(m)
+    }
+
+    /// Puts an old version back; that is itself a new version, so it can be undone the same way.
+    pub fn restore(&self, id: &str, at: u64) -> Result<(), String> {
+        let old = self.version(id, at)?;
+        self.edit(id, "Restored", |m| Ok(*m = old))
+    }
+
+    /// Keeps a copy of `m`. Edits by the same hand within a couple of minutes (a drag, a burst of AI calls)
+    /// share one version, so the list stays readable.
+    fn snapshot(&self, id: &str, m: &Model, by: &str, coalesce: bool) -> Result<(), String> {
+        let dir = self.history(id);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let mut versions = self.versions(id);
+        if let Some((at, who)) = versions.first() {
+            if coalesce && who == by && now.saturating_sub(*at) < 120_000 {
+                let _ = std::fs::remove_file(dir.join(format!("{at}-{who}.json")));
+                versions.remove(0);
+            }
+        }
+        // ponytail: keeps the newest 300; thin out old ones (hourly, daily) if months of history matter.
+        for (at, who) in versions.iter().skip(299) {
+            let _ = std::fs::remove_file(dir.join(format!("{at}-{who}.json")));
+        }
+        let at = versions.first().map_or(now, |v| now.max(v.0 + 1));
+        write_atomic(&dir.join(format!("{at}-{by}.json")), &serde_json::to_string(m).map_err(|e| e.to_string())?)
     }
 
     /// Moves the model's file to `data/.trash/` (recoverable by moving it back and restarting).
@@ -93,6 +153,8 @@ impl App {
         let trash = self.dir.join(".trash");
         std::fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        // Its history goes along, so a new model with the same name starts clean.
+        let _ = std::fs::rename(self.history(id), trash.join(format!("{id}-{stamp}-history")));
         std::fs::rename(self.dir.join(format!("{id}.json")), trash.join(format!("{id}-{stamp}.json"))).map_err(|e| e.to_string())
     }
 
@@ -110,17 +172,25 @@ impl App {
             .ok_or("model name needs letters or digits")?;
         src.name = name.clone();
         let id = slug(&name);
-        self.save(&id, src)?;
+        self.save(&id, src, "Imported")?;
         Ok(id)
     }
 
-    fn save(&self, id: &str, m: Model) -> Result<(), String> {
+    fn save(&self, id: &str, m: Model, by: &str) -> Result<(), String> {
         let json = serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?;
-        std::fs::write(self.dir.join(format!("{id}.json")), &json).map_err(|e| e.to_string())?;
+        write_atomic(&self.dir.join(format!("{id}.json")), &json)?;
+        self.snapshot(id, &m, by, true)?;
         self.models.lock().unwrap().insert(id.to_string(), m);
         let _ = self.tx.send((id.to_string(), json.into()));
         Ok(())
     }
+}
+
+/// Writes beside the target, then renames over it: a crash mid-write leaves the old file whole.
+fn write_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 fn err(e: String) -> Response {
@@ -150,7 +220,7 @@ async fn replace_model(State(app): State<Arc<App>>, Path(id): Path<String>, Json
     if let Err(e) = new.validate() {
         return err(e);
     }
-    app.edit(&id, |m| Ok(*m = new)).map(|_| StatusCode::NO_CONTENT.into_response()).unwrap_or_else(err)
+    app.edit(&id, "You", |m| Ok(*m = new)).map(|_| StatusCode::NO_CONTENT.into_response()).unwrap_or_else(err)
 }
 
 async fn rename_model(State(app): State<Arc<App>>, Path(id): Path<String>, Json(b): Json<NewModel>) -> Response {
@@ -158,11 +228,29 @@ async fn rename_model(State(app): State<Arc<App>>, Path(id): Path<String>, Json(
     if name.is_empty() {
         return err("name can't be empty".into());
     }
-    app.edit(&id, |m| Ok(m.name = name)).map(|_| StatusCode::NO_CONTENT.into_response()).unwrap_or_else(err)
+    app.edit(&id, "You", |m| Ok(m.name = name)).map(|_| StatusCode::NO_CONTENT.into_response()).unwrap_or_else(err)
 }
 
 async fn delete_model(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
     app.trash(&id).map(|_| StatusCode::NO_CONTENT.into_response()).unwrap_or_else(err)
+}
+
+#[derive(serde::Serialize)]
+struct Version {
+    at: u64,
+    by: String,
+}
+
+async fn list_versions(State(app): State<Arc<App>>, Path(id): Path<String>) -> Json<Vec<Version>> {
+    Json(app.versions(&id).into_iter().map(|(at, by)| Version { at, by }).collect())
+}
+
+async fn get_version(State(app): State<Arc<App>>, Path((id, at)): Path<(String, u64)>) -> Response {
+    app.version(&id, at).map(|m| Json(m).into_response()).unwrap_or_else(err)
+}
+
+async fn restore_version(State(app): State<Arc<App>>, Path((id, at)): Path<(String, u64)>) -> Response {
+    app.restore(&id, at).map(|_| StatusCode::NO_CONTENT.into_response()).unwrap_or_else(err)
 }
 
 async fn import_model(State(app): State<Arc<App>>, Json(m): Json<Model>) -> Response {
@@ -186,7 +274,7 @@ async fn local_only(req: axum::extract::Request, next: axum::middleware::Next) -
 
 /// Applies all ops or none.
 async fn apply_ops(State(app): State<Arc<App>>, Path(id): Path<String>, Json(ops): Json<Vec<Op>>) -> Response {
-    app.edit(&id, |m| ops.into_iter().map(|op| m.apply(op)).collect::<Result<Vec<Id>, _>>())
+    app.edit(&id, "You", |m| ops.into_iter().map(|op| m.apply(op)).collect::<Result<Vec<Id>, _>>())
         .map(|ids| Json(ids).into_response())
         .unwrap_or_else(err)
 }
@@ -248,6 +336,9 @@ async fn main() {
         .route("/api/models", get(list_models).post(create_model))
         .route("/api/models/{id}", get(get_model).put(replace_model).delete(delete_model))
         .route("/api/models/{id}/rename", post(rename_model))
+        .route("/api/models/{id}/versions", get(list_versions))
+        .route("/api/models/{id}/versions/{at}", get(get_version))
+        .route("/api/models/{id}/versions/{at}/restore", post(restore_version))
         .route("/api/import", post(import_model))
         .route("/api/models/{id}/ops", post(apply_ops))
         .route("/api/mcp", get(mcp_info))
