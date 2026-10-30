@@ -67,5 +67,10 @@ pub fn check(m: &Model) -> Vec<Issue> {
             }
         }
     }
+    for r in &m.requirements {
+        if r.satisfied_by.is_empty() {
+            push(m.root(), format!("{} isn't satisfied by anything yet: trace it to the thing that meets it.", r.key), vec![]);
+        }
+    }
     out
 }

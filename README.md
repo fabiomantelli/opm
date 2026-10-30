@@ -82,6 +82,25 @@ mudou em todos os diagramas que o mostram.
 - OPL: *Copy* copia o diagrama atual; *All* copia todos, um após o outro.
 - Modelos antigos (de antes dos diagramas) abrem com tudo no SD, sem perder nada.
 
+## Requisitos e rastreabilidade
+
+Painel **Requirements**: escreva o requisito e `Enter` (ganha a chave `REQ-1`, `REQ-2`…; clique na chave ou
+no texto para editar). Para rastrear, selecione o item que atende o requisito e clique em **+ Nome** no
+requisito — ou, no painel do item, use **Satisfies → + requirement**. Clicar num item rastreado leva até ele.
+Requisito sem nada que o atenda fica destacado e aparece nos **Checks**.
+
+## Simular
+
+Botão **▶** na barra da esquerda: roda o diagrama aberto, processo por processo, de cima para baixo
+(num in-zoom, a linha do tempo). **Step** avança um, **Play** vai sozinho, **Reset** recomeça.
+- Objetos que ainda não existem (ou já foram consumidos) ficam apagados; o estado atual de cada objeto fica
+  preenchido; o processo que acabou de rodar brilha e o próximo fica tracejado.
+- O registro diz o que cada processo consumiu, mudou e gerou. Um processo com **condição** que não é
+  atendida é pulado; um processo sem o que precisa **para a simulação** e mostra o que faltou (em vermelho) —
+  quase sempre uma ligação ou um estado faltando no modelo.
+- Vale o modelo inteiro, não só o que está desenhado: uma ligação escondida neste diagrama ainda conta.
+- Simplificações: ordem pela posição (não segue invocações); num XOR de resultados, gera a primeira opção.
+
 ## Modelos: renomear, exportar, importar, apagar
 
 No botão **⋯** ao lado do nome do modelo:
@@ -92,6 +111,14 @@ No botão **⋯** ao lado do nome do modelo:
   qualquer uma; o restore vira uma versão nova, então também dá para desfazê-lo. É assim que se desfaz o que
   o ChatGPT fez. Ficam as 300 versões mais recentes, em `data/.history/<modelo>/`.
 - **Export JSON** – baixa o modelo completo (todos os diagramas), para guardar ou reusar em outro PC.
+- **Export SysML v2** – o modelo em SysML v2 textual (`.sysml`): objetos físicos viram `part def`,
+  informacionais `item def`, processos `action def` com entradas/saídas (`in`/`out`/`inout`), agregação vira
+  partes, exibição atributos, generalização `:>`, estados um `enum def`, in-zoom vira sub-ações com
+  `first … then …`, e os requisitos `requirement def`. Condições, eventos, agentes e rastreios vão como
+  comentários. É um ponto de partida para levar o modelo a outras ferramentas, não foi validado num compilador SysML.
+- **Report (HTML, printable)** – um arquivo `.html` com todos os diagramas (no tema claro), o OPL de cada um,
+  a tabela de requisitos com o que atende cada um, e os checks. Abra no navegador para ler ou
+  **Ctrl+P → Salvar como PDF** (cada diagrama começa numa página nova).
 - **Export SVG / PNG** – imagem do diagrama na tela (sem seleção nem pontinhos), com as cores do tema atual; PNG em 2x.
 - **Import JSON…** – também dá para arrastar um `.json` exportado para qualquer lugar da página, ou usar
   *Import…* na tela inicial. Vira um modelo novo; se o nome já existir, ganha "(2)".
@@ -140,7 +167,7 @@ arrastar à mão ficam onde você deixou; dali em diante a IA só encaixa os ite
 `T` (Tidy) reorganiza tudo e devolve o layout ao modo automático.
 
 Ferramentas que o ChatGPT recebe: `list_models`, `create_model`, `add_things` (num diagrama: `diagram="SD1"`),
-`add_links` (com `modifier` condition/event e `multiplicity`), `fan` (agrupa ligações em XOR/OR), `zoom_in` e `unfold` (criam diagramas de detalhe), `remove` (do modelo, ou só de um diagrama),
+`add_links` (com `modifier` condition/event e `multiplicity`), `fan` (agrupa ligações em XOR/OR), `add_requirements` (cria e rastreia requisitos), `simulate` (roda um diagrama e devolve o registro), `export_sysml`, `zoom_in` e `unfold` (criam diagramas de detalhe), `remove` (do modelo, ou só de um diagrama),
 `arrange` (reorganiza um diagrama inteiro) e `get_model` (árvore de diagramas, OPL de cada um e os checks).
 O guia que a IA recebe pede para nunca omitir itens para "caber": diagramas grandes viram refinamentos.
 

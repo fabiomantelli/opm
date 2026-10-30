@@ -114,6 +114,10 @@ pub struct Ui {
     chatgpt: RwSignal<bool>,
     /// The Ctrl+K finder is open.
     search: RwSignal<bool>,
+    /// A simulation of the diagram on screen, while one runs.
+    sim: RwSignal<Option<opm_core::sim::Sim>>,
+    /// Stepping by itself.
+    playing: RwSignal<bool>,
     past: StoredValue<Vec<Model>>,
     future: StoredValue<Vec<Model>>,
     fitted: StoredValue<bool>,
@@ -208,6 +212,8 @@ impl Ui {
         self.anim.update_value(|g| *g += 1);
         self.showing.set_value(here);
         self.model.set(Some(v));
+        self.sim.set(None);
+        self.playing.set(false);
         self.select(None);
         self.menu.set(None);
         self.fit();
@@ -408,6 +414,35 @@ impl Ui {
         });
     }
 
+    pub fn simulate(self) {
+        let here = self.here();
+        let sim = self.full.with_untracked(|f| f.as_ref().map(|f| opm_core::sim::Sim::new(f, here)));
+        self.playing.set(false);
+        self.select(None);
+        self.sim.set(sim);
+    }
+
+    /// Runs the next process; false when the run is over.
+    fn sim_step(self) -> bool {
+        let Some(mut sim) = self.sim.get_untracked() else { return false };
+        let more = self.full.with_untracked(|f| f.as_ref().is_some_and(|f| sim.step(f)));
+        self.sim.set(Some(sim));
+        more
+    }
+
+    fn sim_play(self) {
+        if self.playing.get_untracked() {
+            return self.playing.set(false);
+        }
+        self.playing.set(true);
+        spawn_local(async move {
+            while self.playing.get_untracked() && self.sim_step() {
+                TimeoutFuture::new(900).await;
+            }
+            self.playing.set(false);
+        });
+    }
+
     fn zoom_by(self, f: f64, around: P) {
         let (px, py, z) = self.view.get_untracked();
         let nz = (z * f).clamp(0.2, 3.0);
@@ -499,6 +534,31 @@ fn Inspector() -> impl IntoView {
                         .into_iter()
                         .map(|(o, label)| view! { <button class="chip link-chip" class:on=o == here on:click=move |_| ui.go(o)>{label}</button> })
                         .collect_view();
+                    let satisfies = {
+                        let mine: Vec<(Id, String, String)> = m.satisfies(id).into_iter().map(|r| (r.id, r.key.clone(), r.text.clone())).collect();
+                        let others: Vec<(Id, String)> = m.requirements.iter().filter(|r| !r.satisfied_by.contains(&id)).map(|r| (r.id, format!("{} {}", r.key, r.text))).collect();
+                        let chips = mine
+                            .into_iter()
+                            .map(|(rid, key, text)| view! {
+                                <span class="chip req-chip" title=text>
+                                    {key}
+                                    <button title="No longer satisfies it" on:click=move |_| ui.send(vec![Op::Trace { requirement: rid, thing: id, satisfies: false }], |_| {})>"×"</button>
+                                </span>
+                            })
+                            .collect_view();
+                        let picker = (!others.is_empty()).then(|| view! {
+                            <select class="chip add" on:change=move |e| {
+                                if let Ok(rid) = event_target_value(&e).parse::<Id>() {
+                                    ui.send(vec![Op::Trace { requirement: rid, thing: id, satisfies: true }], |_| {});
+                                }
+                            }>
+                                <option value="" selected>"+ requirement"</option>
+                                {others.into_iter().map(|(rid, label)| view! { <option value=rid.to_string()>{label}</option> }).collect_view()}
+                            </select>
+                        });
+                        let none = (m.requirements.is_empty()).then(|| view! { <span class="muted small">"Add requirements in the Requirements panel."</span> });
+                        view! { {chips}{picker}{none} }
+                    };
                     let refine = match t.detail {
                         Some(d) => view! { <button class="ghost-btn" on:click=move |_| ui.go(d)>"Open detail diagram"</button> }.into_any(),
                         None if is_frame => ().into_any(),
@@ -540,6 +600,8 @@ fn Inspector() -> impl IntoView {
                                     <button class="chip add" on:click=move |_| ui.add_state()>"+ state"</button>
                                 </div>
                             })}
+                            <div class="label">"Satisfies"</div>
+                            <div class="chips">{satisfies}</div>
                             <div class="label">"Shown in"</div>
                             <div class="chips">{diagrams}</div>
                             <div class="row-btns">{refine}</div>
@@ -905,6 +967,116 @@ fn Checks() -> impl IntoView {
     }
 }
 
+/// What the system must do, each traced to the things that satisfy it.
+#[component]
+fn Requirements() -> impl IntoView {
+    let ui = ui();
+    let draft = RwSignal::new(String::new());
+    let add = move || {
+        let text = draft.get_untracked();
+        if !text.trim().is_empty() {
+            draft.set(String::new());
+            ui.send(vec![Op::AddRequirement { text, key: None }], |_| {});
+        }
+    };
+    let list = move || {
+        let selected = match ui.sel.get() {
+            Some(Sel::Thing(id)) => Some(id),
+            _ => None,
+        };
+        ui.full.with(|f| {
+            let f = f.as_ref()?;
+            let sel_name = selected.and_then(|id| f.thing(id)).map(|t| t.name.clone());
+            Some(
+                f.requirements
+                    .iter()
+                    .map(|r| {
+                        let rid = r.id;
+                        let chips = r
+                            .satisfied_by
+                            .iter()
+                            .filter_map(|&t| f.thing(t))
+                            .map(|t| {
+                                let tid = t.id;
+                                let opd = f.shown_in(tid).first().copied().unwrap_or(f.root());
+                                view! {
+                                    <span class="chip">
+                                        <span class="go" on:click=move |_| ui.focus(opd, tid)>{t.name.clone()}</span>
+                                        <button title="Remove this trace" on:click=move |_| ui.send(vec![Op::Trace { requirement: rid, thing: tid, satisfies: false }], |_| {})>"×"</button>
+                                    </span>
+                                }
+                            })
+                            .collect_view();
+                        let trace = selected.filter(|t| !r.satisfied_by.contains(t)).zip(sel_name.clone()).map(|(tid, name)| view! {
+                            <button class="chip add" title="The selected thing satisfies this requirement" on:click=move |_| ui.send(vec![Op::Trace { requirement: rid, thing: tid, satisfies: true }], |_| {})>
+                                "+ " {name}
+                            </button>
+                        });
+                        let missing = r.satisfied_by.is_empty();
+                        view! {
+                            <li class:missing=missing>
+                                <div class="req-head">
+                                    <input class="req-key" prop:value=r.key.clone() on:change=move |e| ui.send(vec![Op::EditRequirement { id: rid, key: Some(event_target_value(&e)), text: None }], |_| {}) />
+                                    <input class="req-text" prop:value=r.text.clone() on:change=move |e| ui.send(vec![Op::EditRequirement { id: rid, key: None, text: Some(event_target_value(&e)) }], |_| {}) />
+                                    <button class="ghost-btn icon" title="Delete requirement" on:click=move |_| ui.send(vec![Op::Remove { id: rid }], |_| {})>"×"</button>
+                                </div>
+                                <div class="chips">
+                                    {chips}
+                                    {trace}
+                                    {(missing && selected.is_none()).then(|| view! { <span class="muted small">"Select the thing that satisfies it, then click + here."</span> })}
+                                </div>
+                            </li>
+                        }
+                    })
+                    .collect_view(),
+            )
+        })
+    };
+    let n = move || ui.full.with(|f| f.as_ref().map_or(0, |f| f.requirements.len()));
+    view! {
+        <section class="panel reqs">
+            <header><h3>"Requirements"</h3><span class="count">{n}</span></header>
+            <ul>{list}</ul>
+            <form class="req-new" on:submit=move |e| { e.prevent_default(); add() }>
+                <input class="field-input" placeholder="New requirement, e.g. Serve in under 30 s (Enter)" prop:value=draft on:input=move |e| draft.set(event_target_value(&e)) />
+            </form>
+        </section>
+    }
+}
+
+/// Play the diagram: step through its processes and watch objects come, go and change state.
+#[component]
+fn SimBar() -> impl IntoView {
+    let ui = ui();
+    move || {
+        let sim = ui.sim.get()?;
+        let name = |id: Id| ui.model.with_untracked(|m| m.as_ref().and_then(|m| m.thing(id)).map(|t| t.name.clone())).unwrap_or_default();
+        let status = if sim.blocked {
+            "Stopped".to_string()
+        } else if sim.done() {
+            "Finished".to_string()
+        } else {
+            format!("Next: {} ({}/{})", name(sim.order[sim.next]), sim.next + 1, sim.order.len())
+        };
+        let log = sim.log.iter().rev().take(6).rev().cloned().map(|l| view! { <li>{l}</li> }).collect_view();
+        let done = sim.done();
+        Some(view! {
+            <div class="simbar">
+                <div class="sim-head">
+                    <strong>"Simulation"</strong>
+                    <span class="muted small">{status}</span>
+                    <span class="spacer"></span>
+                    <button class="ghost-btn" title="Start over" on:click=move |_| ui.simulate()>"Reset"</button>
+                    <button class="ghost-btn" disabled=done on:click=move |_| { ui.playing.set(false); ui.sim_step(); }>"Step"</button>
+                    <button class="primary" disabled=done on:click=move |_| ui.sim_play()>{move || if ui.playing.get() { "Pause" } else { "Play" }}</button>
+                    <button class="ghost-btn icon" title="Close" on:click=move |_| { ui.playing.set(false); ui.sim.set(None) }>"×"</button>
+                </div>
+                <ol class="sim-log">{log}</ol>
+            </div>
+        })
+    }
+}
+
 #[component]
 fn OplPanel() -> impl IntoView {
     let ui = ui();
@@ -1040,6 +1212,9 @@ fn Toolbar() -> impl IntoView {
                     <div class="picker-list">{existing}</div>
                 </div>
             </Show>
+            <button title="Simulate this diagram" class:on=move || ui.sim.with(|s| s.is_some()) on:click=move |_| if ui.sim.with_untracked(|s| s.is_some()) { ui.sim.set(None) } else { ui.simulate() }>
+                <svg viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" class="ic line" /></svg>
+            </button>
             <span class="sep"></span>
             <button title="Undo (Ctrl+Z)" on:click=move |_| ui.undo()>
                 <svg viewBox="0 0 24 24"><path d="M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3" class="ic line" /></svg>
@@ -1199,6 +1374,8 @@ fn ModelMenu() -> impl IntoView {
                     {item("Export JSON (to reuse)", Box::new(move || ui.export(Format::Json)))}
                     {item("Export SVG (image)", Box::new(move || ui.export(Format::Svg)))}
                     {item("Export PNG (image)", Box::new(move || ui.export(Format::Png)))}
+                    {item("Export SysML v2", Box::new(move || ui.export(Format::SysMl)))}
+                    {item("Report (HTML, printable)", Box::new(move || ui.report()))}
                     {item("Import JSON…", Box::new(move || ui.import_pick()))}
                     <hr />
                     <button class="danger-item" on:click=move |_| { open.set(false); dialog.set(Some(Dialog::Delete)) }>"Delete model…"</button>
@@ -1320,6 +1497,8 @@ fn App() -> impl IntoView {
         live: RwSignal::new(false),
         chatgpt: RwSignal::new(false),
         search: RwSignal::new(false),
+        sim: RwSignal::new(None),
+        playing: RwSignal::new(false),
         past: StoredValue::new(vec![]),
         future: StoredValue::new(vec![]),
         fitted: StoredValue::new(false),
@@ -1457,6 +1636,7 @@ fn App() -> impl IntoView {
                             <Diagrams />
                             <Inspector />
                             <Checks />
+                            <Requirements />
                             <OplPanel />
                         </aside>
                     </div>

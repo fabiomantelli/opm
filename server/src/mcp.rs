@@ -1,6 +1,6 @@
 //! MCP tools so ChatGPT (or any MCP client) can build OPM models by name.
 use crate::App;
-use opm_core::{check::check, opl, Affiliation, Essence, FanKind, Id, Kind, LinkKind, Model, Modifier, Op};
+use opm_core::{check::check, opl, sim::Sim, sysml, Affiliation, Essence, FanKind, Id, Kind, LinkKind, Model, Modifier, Op};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerConfig},
@@ -51,6 +51,10 @@ Link details (add_links fields):
 - alternatives: links of one kind sharing an end can be grouped with the fan tool: xor = exactly one ('Brewing yields either
   Espresso or Lungo'), or = at least one.
 States: mark the starting state initial_state and end states final_states in add_things.
+Requirements: record what the system must do with add_requirements and trace each one to the things that satisfy it
+(usually a process, sometimes an object). get_model lists them and the checks report untraced ones.
+Verify behavior with simulate(diagram): it runs the diagram's processes top to bottom and says what each consumed,
+changed and yielded, or why one couldn't run (a missing input or wrong state usually means a missing link or state).
 Mark physical things physical=true and external ones environmental=true. Every process should transform at least one object
 (consumption, result or effect); avoid things with no links.";
 
@@ -200,6 +204,25 @@ pub struct FanLinks {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct RequirementSpec {
+    /// Short reference such as "REQ-3"; default: the next number. An existing key updates that requirement.
+    #[serde(default)]
+    key: Option<String>,
+    /// What the system must do, e.g. "Deliver an espresso within 30 seconds".
+    #[serde(default)]
+    text: Option<String>,
+    /// Names of the things that satisfy it (added to its trace).
+    #[serde(default)]
+    satisfied_by: Vec<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AddRequirements {
+    model: String,
+    requirements: Vec<RequirementSpec>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct AddLinks {
     model: String,
     links: Vec<LinkSpec>,
@@ -279,6 +302,14 @@ fn summary(id: &str, m: &Model) -> String {
         out += &format!("\nOPL of {title}:\n");
         for s in sentences {
             out += &format!("{}\n", s.text);
+        }
+    }
+    if !m.requirements.is_empty() {
+        out += "\nRequirements:\n";
+        for r in &m.requirements {
+            let by: Vec<&str> = r.satisfied_by.iter().filter_map(|&t| m.thing(t)).map(|t| t.name.as_str()).collect();
+            let by = if by.is_empty() { "NOT satisfied yet".to_string() } else { format!("satisfied by {}", by.join(", ")) };
+            out += &format!("- {}: {} ({by})\n", r.key, r.text);
         }
     }
     let issues = check(m);
@@ -400,6 +431,46 @@ impl Mcp {
             m.apply(Op::Fan { links, kind })?;
             Ok(summary(&p.model, m))
         })
+    }
+
+    #[tool(description = "Add requirements (or update one by its key) and trace them to the things that satisfy them, by name.")]
+    async fn add_requirements(&self, Parameters(p): Parameters<AddRequirements>) -> Result<String, String> {
+        self.app.edit(&p.model, "AI", |m| {
+            for r in p.requirements {
+                let existing = r.key.as_deref().and_then(|k| m.requirements.iter().find(|x| x.key.eq_ignore_ascii_case(k.trim()))).map(|x| x.id);
+                let id = match existing {
+                    Some(id) => {
+                        m.apply(Op::EditRequirement { id, key: None, text: r.text.clone() })?;
+                        id
+                    }
+                    None => {
+                        let text = r.text.clone().ok_or("a new requirement needs text")?;
+                        m.apply(Op::AddRequirement { text, key: r.key.clone() })?
+                    }
+                };
+                for name in &r.satisfied_by {
+                    let thing = thing_id(m, name)?;
+                    m.apply(Op::Trace { requirement: id, thing, satisfies: true })?;
+                }
+            }
+            Ok(summary(&p.model, m))
+        })
+    }
+
+    #[tool(description = "Simulate a diagram (default SD): its processes run top to bottom, consuming, changing and yielding objects. Returns the step log, ending at the first process that can't run.")]
+    async fn simulate(&self, Parameters(p): Parameters<DiagramRef>) -> Result<String, String> {
+        let m = self.app.get(&p.model).ok_or_else(|| format!("no model '{}'", p.model))?;
+        let opd = diagram(&m, &p.diagram)?;
+        let mut sim = Sim::new(&m, opd);
+        while sim.step(&m) {}
+        let end = if sim.blocked { "Stopped: fix the links or states above, then simulate again." } else { "Finished." };
+        Ok(format!("Simulation of {}:\n{}\n{end}", m.title(opd), sim.log.join("\n")))
+    }
+
+    #[tool(description = "The model in SysML v2 textual notation (part/item/action defs, states as enums, sub-actions in order, requirements).")]
+    async fn export_sysml(&self, Parameters(p): Parameters<ModelRef>) -> Result<String, String> {
+        let m = self.app.get(&p.model).ok_or_else(|| format!("no model '{}'", p.model))?;
+        Ok(sysml::export(&m))
     }
 
     #[tool(description = "Open a detail diagram for a process (in-zooming): its subprocesses go inside it, in time order. Returns the diagram label to pass as `diagram` to add_things. Reuses the existing one if any.")]

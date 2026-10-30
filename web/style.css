@@ -391,3 +391,36 @@ kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5p
 .finder-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; text-align: left; border: 0; background: transparent; color: var(--ink); padding: 8px 12px; border-radius: 8px; font: inherit; cursor: pointer; }
 .finder-row.on { background: var(--accent-soft); }
 .field-input { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--bg); color: var(--ink); font: inherit; }
+
+/* requirements */
+.reqs li { padding: 6px 8px; border-radius: 8px; display: flex; flex-direction: column; gap: 6px; }
+.reqs li.missing { background: color-mix(in srgb, var(--danger) 7%, transparent); }
+.req-head { display: flex; gap: 6px; align-items: center; }
+.req-key { width: 84px; flex: none; font-weight: 600; font-size: 12px; }
+.req-text { flex: 1; min-width: 0; font-size: 13px; }
+.req-key, .req-text { border: 1px solid transparent; border-radius: 6px; padding: 3px 5px; background: transparent; color: var(--ink); font-family: inherit; }
+.req-key:hover, .req-text:hover, .req-key:focus, .req-text:focus { border-color: var(--line); background: var(--bg); outline: none; }
+.reqs .go { cursor: pointer; }
+.reqs .go:hover { text-decoration: underline; }
+.req-new { padding: 6px 18px 4px; }
+.req-chip { border-color: var(--accent); color: var(--accent); }
+select.chip.add { appearance: none; cursor: pointer; }
+
+/* simulation */
+.toolbar button.on { background: var(--accent-soft); }
+.thing.absent { opacity: .22; }
+.thing.ran .body { stroke: var(--accent); stroke-width: 3.4; filter: drop-shadow(0 0 6px var(--accent)); }
+.thing.upnext .body { stroke-dasharray: 6 4; stroke-width: 2.4; }
+.thing.stuck .body { stroke: var(--danger); stroke-width: 3.4; }
+.state.now rect:first-child { fill: var(--state); }
+.state.now text { fill: var(--panel); font-weight: 700; }
+.thing { transition: opacity .3s; }
+.simbar {
+  position: absolute; left: 50%; bottom: 56px; transform: translateX(-50%); width: min(560px, calc(100% - 32px)); z-index: 6;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); padding: 10px 12px;
+}
+.sim-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sim-head .spacer { flex: 1; }
+.sim-log { margin: 8px 0 0; padding-left: 20px; font-size: 13px; max-height: 140px; overflow: auto; }
+.sim-log li:last-child { font-weight: 600; }
+@media (prefers-reduced-motion: reduce) { .thing { transition: none; } }

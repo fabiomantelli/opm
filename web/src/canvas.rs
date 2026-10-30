@@ -795,7 +795,7 @@ fn link_view(l: &Link, ends: &Ends, g: &LinkGeo, cls: &str, style: LinkStyle) ->
     view! { <g>{lines}{deco}{modifier}{count}</g> }
 }
 
-fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>) -> AnyView {
+fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>, now: Option<Id>) -> AnyView {
     let (w, h) = size(t);
     let cls = format!(
         "thing {} {cls}{}{}",
@@ -823,10 +823,11 @@ fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>) -> AnyView {
         .zip(&t.states)
         .map(|((sid, x, y, sw, sh), s)| {
             let c = format!(
-                "state{}{}{}",
+                "state{}{}{}{}",
                 if sel_state == Some(sid) { " sel" } else { "" },
                 if s.initial { " initial" } else { "" },
                 if s.final_ { " final" } else { "" },
+                if now == Some(sid) { " now" } else { "" },
             );
             view! {
                 <g class=c>
@@ -866,11 +867,27 @@ pub fn Canvas() -> impl IntoView {
             Some(Drag::Link { target: Some((id, _)), .. }) => Some(*id),
             _ => None,
         });
+        let sim = ui.sim.get();
         ui.model.with(|m| {
             m.iter()
                 .flat_map(|m| &m.things)
                 .map(|t| {
                     let mut cls = String::new();
+                    // While simulating: objects that don't exist fade, the current state lights up,
+                    // the process that just ran glows and the next one is outlined.
+                    let mut now = None;
+                    if let Some(sim) = &sim {
+                        match t.kind {
+                            Kind::Object => match sim.exists.get(&t.id) {
+                                Some(s) => now = *s,
+                                None => cls += " absent",
+                            },
+                            Kind::Process if sim.last == Some(t.id) => cls += " ran",
+                            Kind::Process if sim.order.get(sim.next) == Some(&t.id) && !sim.blocked => cls += " upnext",
+                            Kind::Process if sim.blocked && sim.order.get(sim.next) == Some(&t.id) => cls += " stuck",
+                            _ => {}
+                        }
+                    }
                     if group.contains(&t.id) {
                         cls += " sel";
                     }
@@ -886,7 +903,7 @@ pub fn Canvas() -> impl IntoView {
                     let ss = sel_state.filter(|s| t.states.iter().any(|x| x.id == *s));
                     let states: Vec<String> = t.states.iter().map(|s| format!("{}:{}:{}{}", s.id, s.name, s.initial, s.final_)).collect();
                     let key = format!(
-                        "{}|{}|{}|{}|{:?}|{:?}|{}|{cls}|{ss:?}|{:?}|{:?}",
+                        "{}|{}|{}|{}|{:?}|{:?}|{}|{cls}|{ss:?}|{now:?}|{:?}|{:?}",
                         t.id,
                         t.x,
                         t.y,
@@ -897,7 +914,7 @@ pub fn Canvas() -> impl IntoView {
                         t.frame,
                         t.detail,
                     );
-                    (key, t.clone(), cls, ss)
+                    (key, t.clone(), cls, ss, now)
                 })
                 .collect::<Vec<_>>()
         })
@@ -1030,7 +1047,7 @@ pub fn Canvas() -> impl IntoView {
                 {markers()}
                 <g transform=transform>
                     <g>
-                        <For each=thing_items key=|i| i.0.clone() children=|(_, t, cls, ss)| thing_view(&t, &cls, ss) />
+                        <For each=thing_items key=|i| i.0.clone() children=|(_, t, cls, ss, now)| thing_view(&t, &cls, ss, now) />
                     </g>
                     // Links on top so state-specific links visibly touch their state pill.
                     <g>
@@ -1052,6 +1069,7 @@ pub fn Canvas() -> impl IntoView {
                 </div>
             </Show>
             <Crumbs />
+            <crate::SimBar />
             <ContextBar />
             <RenameBox />
             <LinkMenu />

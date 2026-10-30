@@ -16,8 +16,8 @@ const STYLE = ['fill', 'fill-opacity', 'stroke', 'stroke-width', 'stroke-dasharr
   'opacity', 'font-family', 'font-size', 'font-weight', 'text-anchor', 'dominant-baseline'];
 const UI_ONLY = '.port, .rubber, .rubber-dot, .marquee, .guide';
 
-// The diagram in the box (x, y, w, h) of model coordinates as a standalone .svg, or a 2x .png.
-export function exportImage(svg, x, y, w, h, png, name) {
+// The diagram in the box (x, y, w, h) of model coordinates as standalone SVG markup, styles inlined.
+export function svgMarkup(svg, x, y, w, h) {
   const clone = svg.cloneNode(true);
   const src = [svg, ...svg.querySelectorAll('*')];
   const dst = [clone, ...clone.querySelectorAll('*')];
@@ -35,7 +35,12 @@ export function exportImage(svg, x, y, w, h, png, name) {
   clone.prepend(bg);
   Object.entries({ xmlns: 'http://www.w3.org/2000/svg', viewBox: `${x} ${y} ${w} ${h}`, width: w, height: h })
     .forEach(([k, v]) => clone.setAttribute(k, v));
-  const text = new XMLSerializer().serializeToString(clone);
+  return new XMLSerializer().serializeToString(clone);
+}
+
+// The diagram in the box (x, y, w, h) of model coordinates as a standalone .svg, or a 2x .png.
+export function exportImage(svg, x, y, w, h, png, name) {
+  const text = svgMarkup(svg, x, y, w, h);
   if (!png) return save(name, new Blob([text], { type: 'image/svg+xml' }));
   const img = new Image();
   img.onload = () => {

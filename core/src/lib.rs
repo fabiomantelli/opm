@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 pub mod check;
 pub mod layout;
 pub mod opl;
+pub mod sim;
+pub mod sysml;
 
 pub type Id = u32;
 
@@ -205,6 +207,17 @@ pub struct Fan {
     pub links: Vec<Id>,
 }
 
+/// A requirement and the things that satisfy it (traceability).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Requirement {
+    pub id: Id,
+    /// Short reference, unique in the model: "REQ-1".
+    pub key: String,
+    pub text: String,
+    #[serde(default)]
+    pub satisfied_by: Vec<Id>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub name: String,
@@ -215,6 +228,8 @@ pub struct Model {
     pub opds: Vec<Opd>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fans: Vec<Fan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requirements: Vec<Requirement>,
     pub next_id: Id,
 }
 
@@ -317,7 +332,22 @@ pub enum Op {
         #[serde(default)]
         kind: Option<FanKind>,
     },
-    /// Thing (from the whole model, with its links and detail diagrams), state, or link.
+    /// Adds a requirement; `key` defaults to the next "REQ-n".
+    AddRequirement {
+        text: String,
+        #[serde(default)]
+        key: Option<String>,
+    },
+    EditRequirement {
+        id: Id,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// Marks `thing` as satisfying `requirement` (or not).
+    Trace { requirement: Id, thing: Id, satisfies: bool },
+    /// Thing (from the whole model, with its links and detail diagrams), state, link, or requirement.
     Remove { id: Id },
     /// Paste into `opd`: things (with states) and the links among them, carrying any ids, placed at
     /// `at` (by original id) shifted by (dx, dy). They get fresh ids and unique names ("X copy").
@@ -366,7 +396,7 @@ impl Model {
     /// diagram showing everything where it was.
     pub fn normalize(&mut self) {
         let max = self.things.iter().flat_map(|t| std::iter::once(t.id).chain(t.states.iter().map(|s| s.id)));
-        let max = max.chain(self.links.iter().map(|l| l.id)).chain(self.opds.iter().map(|o| o.id)).chain(self.fans.iter().map(|f| f.id)).max().unwrap_or(0);
+        let max = max.chain(self.links.iter().map(|l| l.id)).chain(self.opds.iter().map(|o| o.id)).chain(self.fans.iter().map(|f| f.id)).chain(self.requirements.iter().map(|r| r.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(max + 1);
         if self.opds.is_empty() {
             let shows = self.things.iter().map(|t| Shown { thing: t.id, x: t.x, y: t.y, auto: t.auto, inside: false }).collect();
@@ -379,7 +409,7 @@ impl Model {
     pub fn validate(&self) -> Result<(), String> {
         let mut seen = HashSet::new();
         let ids = self.things.iter().flat_map(|t| std::iter::once(t.id).chain(t.states.iter().map(|s| s.id)));
-        for id in ids.chain(self.links.iter().map(|l| l.id)).chain(self.opds.iter().map(|o| o.id)).chain(self.fans.iter().map(|f| f.id)) {
+        for id in ids.chain(self.links.iter().map(|l| l.id)).chain(self.opds.iter().map(|o| o.id)).chain(self.fans.iter().map(|f| f.id)).chain(self.requirements.iter().map(|r| r.id)) {
             if id == 0 || id >= self.next_id || !seen.insert(id) {
                 return Err(format!("bad or duplicate id {id}"));
             }
@@ -391,6 +421,9 @@ impl Model {
             if [l.from_state, l.to_state].into_iter().flatten().any(|s| self.state(s).is_none()) {
                 return Err(format!("link {} points to a missing state", l.id));
             }
+        }
+        if self.requirements.iter().any(|r| r.satisfied_by.iter().any(|t| self.thing(*t).is_none())) {
+            return Err("a requirement points to a missing thing".into());
         }
         if self.fans.iter().any(|f| f.links.iter().any(|l| !self.links.iter().any(|x| x.id == *l))) {
             return Err("a fan points to a missing link".into());
@@ -511,7 +544,24 @@ impl Model {
             .collect();
         v.fans = self.fans.clone();
         v.prune_fans();
+        v.requirements = self.requirements.clone();
         v
+    }
+
+    /// Requirements `thing` satisfies.
+    pub fn satisfies(&self, thing: Id) -> Vec<&Requirement> {
+        self.requirements.iter().filter(|r| r.satisfied_by.contains(&thing)).collect()
+    }
+
+    fn check_key(&self, key: &str, except: Option<Id>) -> Result<String, String> {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err("requirement key is empty".into());
+        }
+        if self.requirements.iter().any(|r| r.key.eq_ignore_ascii_case(key) && Some(r.id) != except) {
+            return Err(format!("requirement '{key}' already exists"));
+        }
+        Ok(key.to_string())
     }
 
     /// Drops links that are gone from fans, and fans left with fewer than two links.
@@ -565,6 +615,10 @@ impl Model {
             }
         }
         self.prune_fans();
+        let things: HashSet<Id> = self.things.iter().map(|t| t.id).collect();
+        for r in &mut self.requirements {
+            r.satisfied_by.retain(|t| things.contains(t));
+        }
     }
 
     /// A free-ish spot for a thing added without a position (automatic arranging tidies it afterwards).
@@ -859,7 +913,50 @@ impl Model {
                 self.fans.push(Fan { id, ..fan });
                 Ok(id)
             }
+            Op::AddRequirement { text, key } => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return Err("requirement text is empty".into());
+                }
+                let key = match key.filter(|k| !k.trim().is_empty()) {
+                    Some(k) => self.check_key(&k, None)?,
+                    None => {
+                        let n = self.requirements.iter().filter_map(|r| r.key.strip_prefix("REQ-")?.parse::<u32>().ok()).max().unwrap_or(0);
+                        format!("REQ-{}", n + 1)
+                    }
+                };
+                let id = self.fresh();
+                self.requirements.push(Requirement { id, key, text, satisfied_by: vec![] });
+                Ok(id)
+            }
+            Op::EditRequirement { id, key, text } => {
+                let key = key.map(|k| self.check_key(&k, Some(id))).transpose()?;
+                let r = self.requirements.iter_mut().find(|r| r.id == id).ok_or("no such requirement")?;
+                if let Some(k) = key {
+                    r.key = k;
+                }
+                if let Some(t) = text.map(|t| t.trim().to_string()) {
+                    if t.is_empty() {
+                        return Err("requirement text is empty".into());
+                    }
+                    r.text = t;
+                }
+                Ok(id)
+            }
+            Op::Trace { requirement, thing, satisfies } => {
+                self.thing(thing).ok_or("no such thing")?;
+                let r = self.requirements.iter_mut().find(|r| r.id == requirement).ok_or("no such requirement")?;
+                r.satisfied_by.retain(|t| *t != thing);
+                if satisfies {
+                    r.satisfied_by.push(thing);
+                }
+                Ok(requirement)
+            }
             Op::Remove { id } => {
+                if let Some(i) = self.requirements.iter().position(|r| r.id == id) {
+                    self.requirements.remove(i);
+                    return Ok(id);
+                }
                 if let Some(i) = self.things.iter().position(|t| t.id == id) {
                     self.things.remove(i);
                     self.links.retain(|l| l.from != id && l.to != id);

@@ -409,3 +409,96 @@ fn conditions_events_multiplicity_fans_and_initial_states() {
     assert_eq!(back, m);
     let _ = wet;
 }
+
+#[test]
+fn requirements_simulation_and_sysml() {
+    use opm_core::{check::check, sim::Sim, sysml, Modifier};
+    let mut m = Model::new("Espresso");
+    let beans = add(&mut m, "Beans", Kind::Object);
+    let water = add(&mut m, "Water", Kind::Object);
+    let espresso = add(&mut m, "Espresso", Kind::Object);
+    let milk = add(&mut m, "Milk", Kind::Object);
+    let making = add(&mut m, "Espresso Making", Kind::Process);
+    let cold = m.apply(Op::AddState { thing: water, name: "cold".into() }).unwrap();
+    let hot = m.apply(Op::AddState { thing: water, name: "hot".into() }).unwrap();
+    for (o, k) in [(beans, LinkKind::Consumption), (water, LinkKind::Effect), (milk, LinkKind::Consumption)] {
+        link(&mut m, o, making, k).unwrap();
+    }
+    link(&mut m, making, espresso, LinkKind::Result).unwrap();
+
+    // Requirements: keys number themselves; an untraced one is reported by the checks.
+    let r1 = m.apply(Op::AddRequirement { text: "Serve espresso in under 30 s".into(), key: None }).unwrap();
+    let r2 = m.apply(Op::AddRequirement { text: "Use fresh beans".into(), key: None }).unwrap();
+    assert_eq!(m.requirements.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), ["REQ-1", "REQ-2"]);
+    assert!(m.apply(Op::EditRequirement { id: r2, key: Some("req-1".into()), text: None }).is_err(), "keys are unique");
+    m.apply(Op::Trace { requirement: r1, thing: making, satisfies: true }).unwrap();
+    assert!(check(&m).iter().any(|i| i.text.starts_with("REQ-2 isn't satisfied")));
+    assert!(!check(&m).iter().any(|i| i.text.starts_with("REQ-1")));
+
+    // In-zoom with three steps in time order (top to bottom).
+    let sd1 = m.apply(Op::Refine { thing: making, unfold: false, from: None }).unwrap();
+    let step = |m: &mut Model, name: &str, y: f64| {
+        m.apply(Op::AddThing { name: name.into(), kind: Kind::Process, essence: Essence::Informatical, affiliation: Default::default(), opd: Some(sd1), x: Some(300.0), y: Some(y), inside: Some(true) }).unwrap()
+    };
+    let (grinding, heating, frothing, extracting) = (step(&mut m, "Grinding", 100.0), step(&mut m, "Heating", 200.0), step(&mut m, "Frothing", 300.0), step(&mut m, "Extracting", 400.0));
+    let ground = m.apply(Op::AddThing { name: "Ground Coffee".into(), kind: Kind::Object, essence: Essence::Physical, affiliation: Default::default(), opd: Some(sd1), x: Some(500.0), y: Some(150.0), inside: Some(true) }).unwrap();
+    link(&mut m, beans, grinding, LinkKind::Consumption).unwrap();
+    link(&mut m, grinding, ground, LinkKind::Result).unwrap();
+    m.apply(Op::AddLink { from: water, to: heating, kind: LinkKind::Effect, from_state: Some(cold), to_state: Some(hot) }).unwrap();
+    let froth = link(&mut m, milk, frothing, LinkKind::Consumption).unwrap();
+    m.apply(Op::SetLink { id: froth, states: None, modifier: Some(Modifier::Condition), multiplicity: None }).unwrap();
+    link(&mut m, ground, extracting, LinkKind::Consumption).unwrap();
+    m.apply(Op::AddLink { from: water, to: extracting, kind: LinkKind::Consumption, from_state: Some(hot), to_state: None }).unwrap();
+    link(&mut m, extracting, espresso, LinkKind::Result).unwrap();
+    for o in [beans, water, espresso, milk] {
+        m.apply(Op::Show { opd: sd1, thing: o, x: Some(0.0), y: Some(0.0), inside: Some(false) }).unwrap();
+    }
+    // Not drawn in SD1 still counts: the milk link lives in the model.
+    m.apply(Op::Hide { opd: sd1, thing: milk }).unwrap();
+    let v = m;
+    let mut sim = Sim::new(&v, sd1);
+    assert_eq!(sim.order, [grinding, heating, frothing, extracting]);
+    assert!(!sim.exists.contains_key(&ground) && !sim.exists.contains_key(&espresso), "made later");
+    assert_eq!(sim.exists[&water], Some(cold));
+    sim.exists.remove(&milk); // no milk today: frothing is skipped, the rest runs
+    while sim.step(&v) {}
+    assert!(!sim.blocked, "{:#?}", sim.log);
+    assert!(sim.exists.contains_key(&espresso) && !sim.exists.contains_key(&beans) && !sim.exists.contains_key(&ground));
+    assert!(!sim.exists.contains_key(&water), "hot water was consumed");
+    assert_eq!(
+        sim.log[1..],
+        [
+            "Grinding consumed Beans, yielded Ground Coffee.",
+            "Heating changed Water from cold to hot.",
+            "Frothing skipped: no Milk.",
+            "Extracting consumed Ground Coffee, consumed Water, yielded Espresso.",
+        ]
+    );
+    // Without hot water, extracting can't run.
+    let mut sim = Sim::new(&v, sd1);
+    sim.exists.insert(water, Some(cold));
+    sim.exists.insert(ground, None);
+    sim.next = 3;
+    assert!(!sim.step(&v) && sim.blocked);
+    assert_eq!(sim.log.last().unwrap(), "Extracting can't run: it needs Water (hot).");
+
+    let text = sysml::export(&v);
+    println!("{text}"); // see it with --nocapture
+    for want in [
+        "package Espresso {",
+        "action def 'Espresso Making' {",
+        "in item beans : Beans;",
+        "inout item water : Water;",
+        "out item espresso : Espresso;",
+        "action grinding : Grinding;",
+        "first grinding then heating;",
+        "first frothing then extracting;",
+        "in item milk : Milk; // condition: skipped if absent",
+        "enum def 'Water State' { enum cold; enum hot; }",
+        "// satisfies REQ-1",
+        "requirement def 'REQ-2' {",
+    ] {
+        assert!(text.contains(want), "missing `{want}` in\n{text}");
+    }
+    let _ = r2;
+}
