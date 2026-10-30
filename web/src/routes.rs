@@ -19,8 +19,8 @@ pub fn state_boxes(t: &Thing) -> Vec<(Id, f64, f64, f64, f64)> {
     let (w, h) = size(t);
     let total: f64 = t.states.iter().map(|s| state_w(&s.name) + 8.0).sum::<f64>() - 8.0;
     let mut x = t.x + (w - total) / 2.0;
-    t.states
-        .iter()
+    Model::states_in_order(t)
+        .into_iter()
         .map(|s| {
             let sw = state_w(&s.name);
             let b = (s.id, x, t.y + h - 40.0, sw, 28.0);
@@ -106,6 +106,7 @@ impl LinkStyle {
 }
 
 /// One drawn piece of a link.
+#[derive(Clone)]
 pub enum Route {
     Line(P, P),
     /// Cubic Bézier: start, control 1, control 2, end.
@@ -327,6 +328,128 @@ fn route(a: &Shape, b: &Shape, style: LinkStyle, off: f64, offs: (f64, f64), gri
     Route::Ortho(best)
 }
 
+/// A point as a zero-size shape.
+fn point(p: P) -> Shape {
+    Shape { cx: p.0, cy: p.1, hw: 0.0, hh: 0.0, ellipse: false }
+}
+
+/// Route from a state pill of an object (box `body`) to `other`. It leaves through the pill's bottom and
+/// the object's bottom edge, then goes around the object when `other` is above, so it never crosses the
+/// object's name or other states. `back` reverses it (the link ends on the pill).
+fn from_pill(pill: &Shape, body: Rect, other: &Shape, other_off: f64, style: LinkStyle, grid: Option<(&Grid, [Id; 2])>, back: bool) -> Route {
+    let b = (pill.cx, pill.cy + pill.hh);
+    let s = (pill.cx, body.3 + 14.0);
+    let (vertical, sg) = side(other, &point(s));
+    let sg = sg as f64;
+    let q = port_at(other, (vertical, sg), other_off);
+    // Just outside the other end's side, where its last segment starts.
+    let qs = if vertical { (q.0, q.1 + sg * 22.0) } else { (q.0 + sg * 22.0, q.1) };
+    let toward = if other.cx < pill.cx { -1.0 } else { 1.0 };
+    let lanes: Vec<f64> = {
+        let mut v = vec![if toward < 0.0 { body.0 - 16.0 } else { body.2 + 16.0 }, if toward < 0.0 { body.2 + 16.0 } else { body.0 - 16.0 }];
+        if qs.0 < body.0 - 16.0 || qs.0 > body.2 + 16.0 {
+            v.insert(0, qs.0);
+        }
+        v
+    };
+    let route = if style == LinkStyle::Orthogonal || other.cy - other.hh < s.1 {
+        let mut cands: Vec<Vec<P>> = vec![];
+        if qs.1 >= s.1 {
+            // Below: drop straight down, then across.
+            cands.push(if vertical { vec![b, (b.0, (s.1 + qs.1) / 2.0), (q.0, (s.1 + qs.1) / 2.0), q] } else { vec![b, (b.0, q.1), q] });
+            cands.push(vec![b, s, (qs.0, s.1), qs, q]);
+        }
+        for &lane in &lanes {
+            // Around the object's side, then in.
+            cands.push(if vertical { vec![b, s, (lane, s.1), (lane, qs.1), qs, q] } else { vec![b, s, (lane, s.1), (lane, q.1), q] });
+        }
+        let len = |c: &Vec<P>| c.windows(2).map(|w| dist(w[0], w[1])).sum::<f64>();
+        // The first stretch is inside the object by design; the rest should cross nothing, not even it.
+        let cost = |c: &Vec<P>| (grid.map_or(0, |(g, skip)| g.cost(&c[1..], [skip[0], skip[0]])), len(c));
+        let cost = |c: &Vec<P>| {
+            let (n, l) = cost(c);
+            // Lines rising back through the object count as crossing it.
+            let through = c.windows(2).skip(1).any(|w| w[0].0 > body.0 && w[0].0 < body.2 && w[1].1 < body.3 && w[0].0 == w[1].0);
+            (n + through as usize * 2, l)
+        };
+        // Straight and curved styles going around take the same right-angle path.
+        let mut best = cands.into_iter().min_by(|a, b| cost(a).partial_cmp(&cost(b)).unwrap()).unwrap();
+        best.dedup_by(|a, b| dist(*a, *b) < 0.5);
+        Route::Ortho(best)
+    } else if style == LinkStyle::Curved {
+        let k = ((q.1 - b.1).abs() / 2.0).max(30.0);
+        let dir = if vertical { (0.0, sg) } else { (sg, 0.0) };
+        Route::Curve(b, (b.0, b.1 + k), (q.0 + dir.0 * k, q.1 + dir.1 * k), q)
+    } else {
+        Route::Ortho(vec![b, s, clip(other, s)])
+    };
+    route.flip(back)
+}
+
+/// Moves apart the middle segments of right-angle links that run along the same line, so each can be
+/// followed: 8px apart, ordered by where they come from and go to so they don't cross each other.
+/// End segments stay put (they sit on the things' ports).
+fn nudge(raw: &mut HashMap<Id, Vec<Route>>) {
+    // (link, piece, segment index, vertical, coordinate, from, to, lean)
+    let mut segs: Vec<(Id, usize, usize, bool, f64, f64, f64, f64)> = vec![];
+    for (&id, routes) in raw.iter() {
+        for (pi, r) in routes.iter().enumerate() {
+            let Route::Ortho(pts) = r else { continue };
+            for i in 1..pts.len().saturating_sub(2) {
+                let (a, b) = (pts[i], pts[i + 1]);
+                let vertical = (a.0 - b.0).abs() < 0.5;
+                if !vertical && (a.1 - b.1).abs() >= 0.5 {
+                    continue;
+                }
+                let (c, lo, hi) = if vertical { (a.0, a.1.min(b.1), a.1.max(b.1)) } else { (a.1, a.0.min(b.0), a.0.max(b.0)) };
+                // Which way its neighbors turn: toward lower or higher coordinates.
+                let (p0, p3) = (pts[i - 1], pts[i + 2]);
+                let lean = if vertical { p0.0 + p3.0 - 2.0 * c } else { p0.1 + p3.1 - 2.0 * c };
+                segs.push((id, pi, i, vertical, c, lo, hi, lean));
+            }
+        }
+    }
+    segs.sort_by(|a, b| (a.3, a.4).partial_cmp(&(b.3, b.4)).unwrap());
+    let mut moves: Vec<(Id, usize, usize, bool, f64)> = vec![];
+    let mut start = 0;
+    while start < segs.len() {
+        // Same direction, (nearly) the same line.
+        let mut end = start + 1;
+        while end < segs.len() && segs[end].3 == segs[start].3 && segs[end].4 - segs[end - 1].4 < 4.0 {
+            end += 1;
+        }
+        let mut group: Vec<_> = segs[start..end].to_vec();
+        group.sort_by(|a, b| a.5.total_cmp(&b.5));
+        // Split into runs that actually overlap along the line.
+        let mut runs: Vec<Vec<(Id, usize, usize, bool, f64, f64, f64, f64)>> = vec![];
+        let mut reach = f64::MIN;
+        for g in group {
+            if g.5 < reach - 2.0 {
+                runs.last_mut().unwrap().push(g);
+            } else {
+                runs.push(vec![g]);
+            }
+            reach = reach.max(g.6);
+        }
+        for mut run in runs.into_iter().filter(|r| r.len() > 1) {
+            run.sort_by(|a, b| a.7.total_cmp(&b.7).then(a.0.cmp(&b.0)));
+            let base = run.iter().map(|g| g.4).sum::<f64>() / run.len() as f64;
+            let n = run.len() as f64;
+            for (k, g) in run.iter().enumerate() {
+                moves.push((g.0, g.1, g.2, g.3, base + (k as f64 - (n - 1.0) / 2.0) * 8.0));
+            }
+        }
+        start = end;
+    }
+    for (id, pi, i, vertical, c) in moves {
+        if let Some(Route::Ortho(pts)) = raw.get_mut(&id).and_then(|r| r.get_mut(pi)) {
+            for j in [i, i + 1] {
+                if vertical { pts[j].0 = c } else { pts[j].1 = c }
+            }
+        }
+    }
+}
+
 /// Everything needed to draw and hit-test one link.
 pub struct LinkGeo {
     /// SVG path per drawn piece (an Effect with in/out states has two).
@@ -347,6 +470,8 @@ static REV: AtomicU64 = AtomicU64::new(1);
 pub struct Routes {
     pub style: LinkStyle,
     pub links: HashMap<Id, Arc<LinkGeo>>,
+    /// Routes before nudging, to reuse while dragging.
+    raw: HashMap<Id, Vec<Route>>,
     /// Box and state count per thing at compute time.
     boxes: HashMap<Id, (Rect, usize)>,
     link_ids: Vec<Id>,
@@ -428,12 +553,12 @@ impl Routes {
             }).collect())
         });
 
-        let mut links = HashMap::with_capacity(m.links.len());
+        let mut raw: HashMap<Id, Vec<Route>> = HashMap::with_capacity(m.links.len());
         for l in &m.links {
             if let (Some(p), Some(dirty)) = (reuse, &dirty) {
                 if !dirty.contains(&l.id) {
-                    if let Some(g) = p.links.get(&l.id) {
-                        links.insert(l.id, g.clone());
+                    if let Some(r) = p.raw.get(&l.id) {
+                        raw.insert(l.id, r.clone());
                         continue;
                     }
                 }
@@ -448,10 +573,24 @@ impl Routes {
             let sf = spread.get(&(l.id, f.id)).copied().unwrap_or(0.0);
             let st = spread.get(&(l.id, t.id)).copied().unwrap_or(0.0);
             let g = grid.as_ref().map(|g| (g, [f.id, t.id]));
-            let routes = link_routes(l, f, t, style, off, (sf, st), g);
-            links.insert(l.id, Arc::new(geo(l, routes, style)));
+            raw.insert(l.id, link_routes(l, f, t, style, off, (sf, st), g));
         }
-        Routes { style, links, boxes, link_ids }
+        let mut drawn = raw.clone();
+        if style == LinkStyle::Orthogonal {
+            nudge(&mut drawn);
+        }
+        // Unchanged links keep their geometry (and DOM).
+        let same = prev.filter(|p| p.style == style);
+        let mut links = HashMap::with_capacity(m.links.len());
+        for l in &m.links {
+            let Some(routes) = drawn.remove(&l.id) else { continue };
+            let pts: Vec<Vec<P>> = routes.iter().map(Route::points).collect();
+            match same.and_then(|p| p.links.get(&l.id)).filter(|g| g.pts == pts) {
+                Some(g) => links.insert(l.id, g.clone()),
+                None => links.insert(l.id, Arc::new(geo(l, routes, style))),
+            };
+        }
+        Routes { style, links, raw, boxes, link_ids }
     }
 
     /// The link under `p`, if any.
@@ -467,20 +606,40 @@ impl Routes {
 fn link_routes(l: &Link, f: &Thing, t: &Thing, style: LinkStyle, off: f64, (sf, st): (f64, f64), grid: Option<(&Grid, [Id; 2])>) -> Vec<Route> {
     let obj_from = f.kind == Kind::Object && t.kind == Kind::Process;
     let obj_to = f.kind == Kind::Process && t.kind == Kind::Object;
-    if l.kind == LinkKind::Effect && l.from_state.is_some() && l.to_state.is_some() && (obj_from || obj_to) {
-        let (o, p) = if obj_from { (f, t) } else { (t, f) };
-        let ps = shape_of(p);
-        let po = if obj_from { st } else { sf };
+    if !(obj_from || obj_to) || (l.from_state.is_none() && l.to_state.is_none()) {
+        return vec![route(&shape_of(f), &shape_of(t), style, off, (sf, st), grid)];
+    }
+    // State-specific: the object end sits on a state pill.
+    let (o, p, po) = if obj_from { (f, t, st) } else { (t, f, sf) };
+    let (body, ps) = (thing_box(o), shape_of(p));
+    let g = grid.map(|(g, _)| (g, [p.id, o.id]));
+    let pill = |s: Option<Id>| pill_or_body(o, s);
+    if l.kind == LinkKind::Effect && l.from_state.is_some() && l.to_state.is_some() {
+        // Input state -> process -> output state.
         return vec![
-            route(&pill_or_body(o, l.from_state), &ps, style, off, (0.0, po - 10.0), grid),
-            route(&ps, &pill_or_body(o, l.to_state), style, off, (po + 10.0, 0.0), grid),
+            from_pill(&pill(l.from_state), body, &ps, po - 10.0, style, g, false),
+            from_pill(&pill(l.to_state), body, &ps, po + 10.0, style, g, true),
         ];
     }
-    let s = l.from_state.or(l.to_state);
-    // Ends on a state pill stay centered on it.
-    let fs = if obj_from && s.is_some() { (pill_or_body(f, s), 0.0) } else { (shape_of(f), sf) };
-    let ts = if obj_to && s.is_some() { (pill_or_body(t, s), 0.0) } else { (shape_of(t), st) };
-    vec![route(&fs.0, &ts.0, style, off, (fs.1, ts.1), grid)]
+    // The pill end is `from` when the object is the link's source.
+    vec![from_pill(&pill(l.from_state.or(l.to_state)), body, &ps, po, style, g, !obj_from)]
+}
+
+impl Route {
+    /// The same route walked the other way.
+    fn flip(self, yes: bool) -> Route {
+        if !yes {
+            return self;
+        }
+        match self {
+            Route::Line(a, z) => Route::Line(z, a),
+            Route::Curve(a, c1, c2, z) => Route::Curve(z, c2, c1, a),
+            Route::Ortho(mut pts) => {
+                pts.reverse();
+                Route::Ortho(pts)
+            }
+        }
+    }
 }
 
 fn geo(l: &Link, routes: Vec<Route>, style: LinkStyle) -> LinkGeo {
@@ -496,5 +655,71 @@ fn geo(l: &Link, routes: Vec<Route>, style: LinkStyle) -> LinkGeo {
         pts,
         bbox,
         rev: REV.fetch_add(1, Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opm_core::{Essence, Op};
+
+    fn thing(m: &mut Model, name: &str, kind: Kind, x: f64, y: f64) -> Id {
+        m.apply(Op::AddThing { name: name.into(), kind, essence: Essence::Informatical, affiliation: Default::default(), opd: None, x: Some(x), y: Some(y), inside: None })
+            .unwrap()
+    }
+
+    /// Does a polyline enter the box (shrunk by `inset`)?
+    fn crosses(pts: &[P], r: Rect, inset: f64) -> bool {
+        let r = (r.0 + inset, r.1 + inset, r.2 - inset, r.3 - inset);
+        pts.windows(2).any(|w| (0..=20).any(|k| {
+            let t = k as f64 / 20.0;
+            let (x, y) = (w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t);
+            x > r.0 && x < r.2 && y > r.1 && y < r.3
+        }))
+    }
+
+    #[test]
+    fn state_links_go_around_their_object_and_shared_lanes_spread() {
+        let mut m = Model::new("t");
+        let doc = thing(&mut m, "Document", Kind::Object, 300.0, 300.0);
+        let draft = m.apply(Op::AddState { thing: doc, name: "draft".into() }).unwrap();
+        let fin = m.apply(Op::AddState { thing: doc, name: "final".into() }).unwrap();
+        // A process above-left and one below-right: both links must stay out of the object's body.
+        let above = thing(&mut m, "Reviewing", Kind::Process, 40.0, 60.0);
+        let below = thing(&mut m, "Publishing", Kind::Process, 600.0, 600.0);
+        m.apply(Op::AddLink { from: doc, to: above, kind: LinkKind::Consumption, from_state: Some(draft), to_state: None }).unwrap();
+        m.apply(Op::AddLink { from: doc, to: below, kind: LinkKind::Instrument, from_state: Some(fin), to_state: None }).unwrap();
+        let v = m.view(m.root());
+        let t = v.thing(doc).unwrap();
+        let body = thing_box(t);
+        let pills = state_boxes(t);
+        for style in [LinkStyle::Orthogonal, LinkStyle::Straight, LinkStyle::Curved] {
+            let r = Routes::compute(&v, style, None, false);
+            for (id, g) in &r.links {
+                for pts in &g.pts {
+                    // Leave the pill it starts on out of it; the rest of the object must stay clear.
+                    let inner: Vec<P> = pts.iter().copied().filter(|p| !pills.iter().any(|b| p.0 >= b.1 - 1.0 && p.0 <= b.1 + b.3 + 1.0 && p.1 >= b.2 - 1.0 && p.1 <= body.3 + 1.0)).collect();
+                    assert!(!crosses(&inner, body, 2.0), "{style:?} link {id} crosses the object: {pts:?}");
+                }
+            }
+        }
+        // Pills are ordered toward their processes: draft (linked left) before final (linked right).
+        assert_eq!(pills.iter().map(|b| b.0).collect::<Vec<_>>(), [draft, fin]);
+    }
+
+    #[test]
+    fn overlapping_middle_segments_move_apart() {
+        let mut raw: HashMap<Id, Vec<Route>> = HashMap::new();
+        for (id, y0, y1) in [(1, 0.0, 300.0), (2, 50.0, 250.0), (3, 400.0, 500.0)] {
+            raw.insert(id, vec![Route::Ortho(vec![(0.0, y0), (100.0, y0), (100.0, y1), (200.0, y1)])]);
+        }
+        nudge(&mut raw);
+        let x = |id: Id| match &raw[&id][0] {
+            Route::Ortho(p) => (p[1].0, p[2].0),
+            _ => unreachable!(),
+        };
+        assert_eq!(x(1), (96.0, 96.0));
+        assert_eq!(x(2), (104.0, 104.0));
+        assert_eq!(x(3), (100.0, 100.0), "not overlapping: stays");
     }
 }

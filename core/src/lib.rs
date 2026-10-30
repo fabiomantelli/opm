@@ -77,6 +77,10 @@ pub struct Thing {
     /// Another diagram refines this thing (open it with a double-click).
     #[serde(default, skip_serializing)]
     pub detail: Option<Id>,
+    /// Order to draw the state pills in this diagram: states linked to things on the left come first,
+    /// so their links don't cross. Empty = as listed. See `Model::order_states`.
+    #[serde(default, skip_serializing)]
+    pub state_order: Vec<Id>,
 }
 
 /// A thing shown in a diagram.
@@ -545,7 +549,46 @@ impl Model {
         v.fans = self.fans.clone();
         v.prune_fans();
         v.requirements = self.requirements.clone();
+        v.order_states();
         v
+    }
+
+    /// In a diagram view: orders each object's state pills by where the things linked to them are,
+    /// left to right. States without links here keep their places.
+    pub fn order_states(&mut self) {
+        let centers: HashMap<Id, f64> = self.things.iter().map(|t| (t.id, t.x + layout::size(t).0 / 2.0)).collect();
+        let mut orders = vec![];
+        for t in self.things.iter().filter(|t| t.states.len() > 1) {
+            let pull = |s: Id| {
+                let xs: Vec<f64> = self
+                    .links
+                    .iter()
+                    .filter(|l| l.from_state == Some(s) || l.to_state == Some(s))
+                    .filter_map(|l| centers.get(if l.from == t.id { &l.to } else { &l.from }).copied())
+                    .collect();
+                (!xs.is_empty()).then(|| xs.iter().sum::<f64>() / xs.len() as f64)
+            };
+            let mut order: Vec<Id> = t.states.iter().map(|s| s.id).collect();
+            // The linked states trade places among the slots they hold, sorted by their pull.
+            let slots: Vec<usize> = (0..order.len()).filter(|&i| pull(order[i]).is_some()).collect();
+            let mut linked: Vec<(f64, Id)> = slots.iter().map(|&i| (pull(order[i]).unwrap(), order[i])).collect();
+            linked.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (slot, (_, id)) in slots.iter().zip(linked) {
+                order[*slot] = id;
+            }
+            orders.push((t.id, order));
+        }
+        for (id, order) in orders {
+            if let Some(t) = self.things.iter_mut().find(|t| t.id == id) {
+                t.state_order = order;
+            }
+        }
+    }
+
+    /// A thing's states in drawing order (see `Thing::state_order`).
+    pub fn states_in_order(t: &Thing) -> Vec<&State> {
+        let ordered: Vec<&State> = t.state_order.iter().filter_map(|id| t.states.iter().find(|s| s.id == *id)).collect();
+        if ordered.len() == t.states.len() { ordered } else { t.states.iter().collect() }
     }
 
     /// Requirements `thing` satisfies.
@@ -687,6 +730,7 @@ impl Model {
                     frame: None,
                     inside: false,
                     detail: None,
+                    state_order: vec![],
                 });
                 let shown = Shown { thing: id, x: x.unwrap_or(ax), y: y.unwrap_or(ay), auto: x.is_none(), inside };
                 self.opd_mut(opd)?.shows.push(shown);

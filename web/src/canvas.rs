@@ -145,6 +145,7 @@ impl Ui {
             frame: None,
             inside: false,
             detail: None,
+            state_order: vec![],
         };
         let (w, h) = size(&probe);
         let (mut x, mut y) = at.unwrap_or_else(|| {
@@ -820,7 +821,7 @@ fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>, now: Option<Id>) -> A
     let label_y = if t.states.is_empty() { t.y + h / 2.0 } else { t.y + 24.0 };
     let states = state_boxes(t)
         .into_iter()
-        .zip(&t.states)
+        .filter_map(|b| Some((b, t.states.iter().find(|s| s.id == b.0)?)))
         .map(|((sid, x, y, sw, sh), s)| {
             let c = format!(
                 "state{}{}{}{}",
