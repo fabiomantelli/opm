@@ -16,13 +16,16 @@ pub fn size(t: &Thing) -> (f64, f64) {
         return f;
     }
     match t.kind {
-        Kind::Process => ((text_w(&t.name, 7.8) + 64.0).max(132.0), 66.0),
+        Kind::Process => {
+            let dw = duration_label(t).map_or(0.0, |d| text_w(&d, 6.6) + 56.0);
+            ((text_w(&t.name, 7.8) + 64.0).max(132.0).max(dw), 66.0)
+        }
         Kind::Object => {
-            let more = if t.more_states { state_w(MORE) + 8.0 } else { 0.0 };
+            let more = if t.more_states { state_w(MORE) + 8.0 } else { 0.0 } + value_w(t);
             let sw: f64 = t.states.iter().map(|s| state_w(&s.name) + 8.0).sum::<f64>() + more + 16.0;
             let pw = t.parts.iter().map(|p| text_w(&part_label(p), 7.0) + 48.0).fold(0.0, f64::max);
             let w = (text_w(&t.name, 7.8) + 44.0).max(120.0).max(sw).max(pw);
-            let pills = !t.states.is_empty() || t.more_states;
+            let pills = !t.states.is_empty() || t.more_states || value_w(t) > 0.0;
             let h = match (t.parts.len(), pills) {
                 (0, false) => 58.0,
                 (0, true) => 96.0,
@@ -44,10 +47,54 @@ pub fn part_label(p: &crate::Part) -> String {
     if p.multiplicity.is_empty() { p.name.clone() } else { format!("{} {}", p.multiplicity, p.name) }
 }
 
-/// Center line of a thing's name: centered, or near the top when states or parts sit below it.
+/// Center line of a thing's name: centered, or near the top when states, parts or a value sit below it
+/// (a process with a duration: a little above its center).
 pub fn label_y(t: &Thing) -> f64 {
     let (_, h) = size(t);
-    if t.states.is_empty() && !t.more_states && t.parts.is_empty() { t.y + h / 2.0 } else { t.y + 24.0 }
+    if t.kind == Kind::Process {
+        return t.y + h / 2.0 - if duration_label(t).is_some() { 8.0 } else { 0.0 };
+    }
+    if t.states.is_empty() && !t.more_states && t.parts.is_empty() && value_w(t) == 0.0 { t.y + h / 2.0 } else { t.y + 24.0 }
+}
+
+/// Drawn under a process's name: "1–20 ms (~10)", "≤ 20 ms", "10 ms".
+pub fn duration_label(t: &Thing) -> Option<String> {
+    let d = t.duration.as_ref()?;
+    let u = &d.unit;
+    let range = match (d.min, d.max) {
+        (Some(a), Some(b)) => Some(format!("{a}–{b} {u}")),
+        (Some(a), None) => Some(format!("≥ {a} {u}")),
+        (None, Some(b)) => Some(format!("≤ {b} {u}")),
+        (None, None) => None,
+    };
+    match (range, d.expected) {
+        (Some(r), Some(e)) => Some(format!("{r} (~{e})")),
+        (Some(r), None) => Some(r),
+        (None, Some(e)) => Some(format!("{e} {u}")),
+        (None, None) => None,
+    }
+}
+
+/// An object's value pill: "60 ms", "0–50 ms", "≥ 5 Hz", "≤ 50 ms".
+pub fn value_label(t: &Thing) -> Option<String> {
+    let q = t.measure.as_ref()?;
+    let u = if q.unit.is_empty() { String::new() } else { format!(" {}", q.unit) };
+    Some(match (q.value, q.min, q.max) {
+        (Some(v), ..) => format!("{v}{u}"),
+        (None, Some(a), Some(b)) => format!("{a}–{b}{u}"),
+        (None, Some(a), None) => format!("≥ {a}{u}"),
+        (None, None, Some(b)) => format!("≤ {b}{u}"),
+        _ => return None,
+    })
+}
+
+/// Whether an object's value is outside its allowed range.
+pub fn value_out_of_range(t: &Thing) -> bool {
+    t.measure.as_ref().is_some_and(|q| q.value.is_some_and(|v| q.min.is_some_and(|a| v < a) || q.max.is_some_and(|b| v > b)))
+}
+
+fn value_w(t: &Thing) -> f64 {
+    value_label(t).map_or(0.0, |s| state_w(&s) + 8.0)
 }
 
 /// Layered (Sugiyama) layout, flowing top to bottom: inputs above the processes that use them,
@@ -341,7 +388,7 @@ fn sequence(v: &Model, procs: &[&Thing]) -> Vec<Id> {
     for l in &v.links {
         let (p, o) = if is_proc(l.from) { (l.from, l.to) } else { (l.to, l.from) };
         match l.kind {
-            Invocation => edges.push((l.from, l.to)),
+            Invocation | Overtime | Undertime if l.from != l.to => edges.push((l.from, l.to)),
             Result => produces.push((p, o)),
             Effect if l.to_state.is_some() => produces.push((p, o)),
             Consumption | Instrument | Agent | Effect => uses.push((p, o)),

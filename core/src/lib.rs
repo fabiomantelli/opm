@@ -59,6 +59,12 @@ pub struct Thing {
     pub affiliation: Affiliation,
     #[serde(default)]
     pub states: Vec<State>,
+    /// Processes: how long it takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<Duration>,
+    /// Objects: the value it holds and/or its allowed range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure: Option<Measure>,
     // The fields below describe the thing in one diagram. `Model::view` fills them in for drawing;
     // they are never stored (positions live in `Opd::shows`). Older files kept x/y here: read once to migrate.
     #[serde(default, skip_serializing)]
@@ -174,13 +180,67 @@ pub enum LinkKind {
     Result,
     Effect,
     Invocation,
+    /// Exception: the target process starts when the source runs longer than its maximum duration.
+    Overtime,
+    /// Exception: the target process starts when the source ends before its minimum duration.
+    Undertime,
 }
 
 impl LinkKind {
     pub fn is_procedural(&self) -> bool {
         use LinkKind::*;
-        matches!(self, Agent | Instrument | Consumption | Result | Effect | Invocation)
+        matches!(self, Agent | Instrument | Consumption | Result | Effect | Invocation | Overtime | Undertime)
     }
+}
+
+/// How long a process takes (ISO 19450 duration): any of min, expected and max, in `unit`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Duration {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    /// ms, s, min, h or d.
+    pub unit: String,
+}
+
+impl Duration {
+    /// Seconds per `unit`.
+    pub fn scale(unit: &str) -> Option<f64> {
+        match unit {
+            "ms" => Some(0.001),
+            "s" => Some(1.0),
+            "min" => Some(60.0),
+            "h" => Some(3600.0),
+            "d" => Some(86400.0),
+            _ => None,
+        }
+    }
+
+    /// How long one run takes, in seconds: the expected time, else the middle of min and max, else either.
+    pub fn typical(&self) -> Option<f64> {
+        let v = self.expected.or(match (self.min, self.max) {
+            (Some(a), Some(b)) => Some((a + b) / 2.0),
+            (a, b) => a.or(b),
+        })?;
+        Some(v * Self::scale(&self.unit)?)
+    }
+}
+
+/// A quantity an object (usually an attribute) holds: a value and/or its allowed range, in `unit`
+/// (free text: "ms", "Hz", "PMUs").
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Measure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(default)]
+    pub unit: String,
 }
 
 /// Control modifier of an enabling or transforming link (ISO 19450 "c" and "e" links).
@@ -220,6 +280,9 @@ pub struct Link {
     /// In a diagram view: the route drawn by hand there, if any (stored in `Opd::routes`).
     #[serde(default, skip_serializing)]
     pub route: Option<Route>,
+    /// Among XOR/OR alternatives: how likely this one is (0..1). None = as likely as the others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probability: Option<f64>,
 }
 
 impl Link {
@@ -232,7 +295,7 @@ impl Link {
     /// Can carry a multiplicity: all but generalization, classification and invocation.
     pub fn countable(&self) -> bool {
         use LinkKind::*;
-        !matches!(self.kind, Generalization | Classification | Invocation)
+        !matches!(self.kind, Generalization | Classification | Invocation | Overtime | Undertime)
     }
 }
 
@@ -424,6 +487,24 @@ pub enum Op {
         things: Vec<Id>,
         name: String,
     },
+    /// Sets (or clears, with none) how long a process takes.
+    SetDuration {
+        id: Id,
+        #[serde(default)]
+        duration: Option<Duration>,
+    },
+    /// Sets (or clears, with none) an object's value, range and unit.
+    SetMeasure {
+        id: Id,
+        #[serde(default)]
+        measure: Option<Measure>,
+    },
+    /// Sets (or clears) how likely a link is among its XOR/OR alternatives, 0..1.
+    SetProbability {
+        id: Id,
+        #[serde(default)]
+        probability: Option<f64>,
+    },
     /// Suppresses a state in diagram `opd` (default: the root), or shows it again.
     HideState {
         #[serde(default)]
@@ -465,7 +546,7 @@ pub fn valid_link_kinds(from: Kind, to: Kind) -> Vec<LinkKind> {
     let mut v = match (from, to) {
         (Object, Process) => vec![Agent, Instrument, Consumption, Effect, Exhibition],
         (Process, Object) => vec![Result, Effect, Exhibition],
-        (Process, Process) => vec![Invocation, Aggregation, Generalization, Classification, Exhibition],
+        (Process, Process) => vec![Invocation, Overtime, Undertime, Aggregation, Generalization, Classification, Exhibition],
         (Object, Object) => vec![Aggregation, Exhibition, Generalization, Classification],
     };
     v.push(Tagged(String::new()));
@@ -867,6 +948,8 @@ impl Model {
                     essence,
                     affiliation,
                     states: vec![],
+                    duration: None,
+                    measure: None,
                     x: 0.0,
                     y: 0.0,
                     auto: false,
@@ -1059,8 +1142,8 @@ impl Model {
                 Ok(id)
             }
             Op::AddLink { from, to, kind, from_state, to_state } => {
-                if from == to {
-                    return Err("a thing cannot link to itself".into());
+                if from == to && kind != LinkKind::Invocation {
+                    return Err("only a process invoking itself (a loop) links a thing to itself".into());
                 }
                 let f = self.thing(from).ok_or("no such 'from' thing")?;
                 let t = self.thing(to).ok_or("no such 'to' thing")?;
@@ -1087,7 +1170,7 @@ impl Model {
                     return Err("link already exists".into());
                 }
                 let id = self.fresh();
-                self.links.push(Link { id, from, to, kind, from_state, to_state, modifier: Modifier::None, multiplicity: String::new(), route: None });
+                self.links.push(Link { id, from, to, kind, from_state, to_state, modifier: Modifier::None, multiplicity: String::new(), route: None, probability: None });
                 Ok(id)
             }
             Op::Rename { id, name } => {
@@ -1237,6 +1320,53 @@ impl Model {
                     }
                     r.text = t;
                 }
+                Ok(id)
+            }
+            Op::SetDuration { id, duration } => {
+                let t = self.thing(id).ok_or("no such thing")?;
+                if t.kind != Kind::Process {
+                    return Err(format!("'{}' is an object: only processes take time (give objects a value)", t.name));
+                }
+                let duration = match duration {
+                    Some(d) if d.min.is_some() || d.expected.is_some() || d.max.is_some() => Some(d),
+                    _ => None,
+                };
+                if let Some(d) = &duration {
+                    Duration::scale(&d.unit).ok_or_else(|| format!("unit '{}': use ms, s, min, h or d", d.unit))?;
+                    let vals = [d.min, d.expected, d.max];
+                    if vals.iter().flatten().any(|v| !v.is_finite() || *v < 0.0) {
+                        return Err("durations are numbers, 0 or more".into());
+                    }
+                    if d.min.zip(d.max).is_some_and(|(a, b)| a > b) {
+                        return Err("the minimum duration is above the maximum".into());
+                    }
+                }
+                self.things.iter_mut().find(|t| t.id == id).unwrap().duration = duration;
+                Ok(id)
+            }
+            Op::SetMeasure { id, measure } => {
+                let t = self.thing(id).ok_or("no such thing")?;
+                if t.kind != Kind::Object {
+                    return Err(format!("'{}' is a process: give it a duration instead", t.name));
+                }
+                let measure = measure.filter(|m| m.value.is_some() || m.min.is_some() || m.max.is_some());
+                if let Some(m) = &measure {
+                    if [m.value, m.min, m.max].iter().flatten().any(|v| !v.is_finite()) {
+                        return Err("values must be numbers".into());
+                    }
+                    if m.min.zip(m.max).is_some_and(|(a, b)| a > b) {
+                        return Err("the range's minimum is above its maximum".into());
+                    }
+                }
+                let measure = measure.map(|m| Measure { unit: m.unit.trim().to_string(), ..m });
+                self.things.iter_mut().find(|t| t.id == id).unwrap().measure = measure;
+                Ok(id)
+            }
+            Op::SetProbability { id, probability } => {
+                if probability.is_some_and(|p| !(0.0..=1.0).contains(&p)) {
+                    return Err("a probability is between 0 and 1".into());
+                }
+                self.links.iter_mut().find(|l| l.id == id).ok_or("no such link")?.probability = probability;
                 Ok(id)
             }
             Op::HideState { opd, state, hidden } => {

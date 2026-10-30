@@ -3,7 +3,7 @@
 //! While a thing is dragged only the links around it are re-routed.
 use crate::P;
 use opm_core::{
-    layout::{size, state_w, MORE},
+    layout::{size, state_w, value_label, MORE},
     Id, Kind, Link, LinkKind, Model, Thing,
 };
 use std::{
@@ -17,7 +17,7 @@ use std::{
 /// (state id, x, y, w, h) pills along the bottom of an object.
 pub fn state_boxes(t: &Thing) -> Vec<(Id, f64, f64, f64, f64)> {
     let (w, h) = size(t);
-    let more = if t.more_states { state_w(MORE) + 8.0 } else { 0.0 };
+    let more = if t.more_states { state_w(MORE) + 8.0 } else { 0.0 } + value_label(t).map_or(0.0, |v| state_w(&v) + 8.0);
     let total: f64 = t.states.iter().map(|s| state_w(&s.name) + 8.0).sum::<f64>() + more - 8.0;
     let mut x = t.x + (w - total) / 2.0;
     Model::states_in_order(t)
@@ -40,6 +40,19 @@ pub fn more_box(t: &Thing) -> Option<(f64, f64, f64, f64)> {
         None => t.x + (w - state_w(MORE)) / 2.0,
     };
     Some((x, t.y + h - 40.0, state_w(MORE), 28.0))
+}
+
+/// (x, y, w, h) of an object's value pill: after its states (and "…").
+pub fn value_box(t: &Thing) -> Option<(f64, f64, f64, f64)> {
+    let label = value_label(t)?;
+    let (w, h) = size(t);
+    let vw = state_w(&label);
+    let x = match (more_box(t), state_boxes(t).last()) {
+        (Some(b), _) => b.0 + b.2 + 8.0,
+        (None, Some(b)) => b.1 + b.3 + 8.0,
+        (None, None) => t.x + (w - vw) / 2.0,
+    };
+    Some((x, t.y + h - 40.0, vw, 28.0))
 }
 
 pub struct Shape {
@@ -649,7 +662,7 @@ impl Routes {
             let effect_pair = l.kind == LinkKind::Effect && l.from_state.is_some() && l.to_state.is_some();
             let routes = match &l.route {
                 // ponytail: effects drawn as two pieces (in-state, out-state) stay automatic.
-                Some(r) if !effect_pair => vec![hand_route(l, r, f, t, style)],
+                Some(r) if !effect_pair && l.from != l.to => vec![hand_route(l, r, f, t, style)],
                 _ => link_routes(l, f, t, style, off, (sf, st), g),
             };
             raw.insert(l.id, routes);
@@ -686,6 +699,13 @@ impl Routes {
 }
 
 fn link_routes(l: &Link, f: &Thing, t: &Thing, style: LinkStyle, off: f64, (sf, st): (f64, f64), grid: Option<(&Grid, [Id; 2])>) -> Vec<Route> {
+    // A process invoking itself: a loop out of its right side and back.
+    if l.from == l.to {
+        let s = shape_of(f);
+        let (a, b) = ((s.cx + s.hw * 0.71, s.cy - s.hh * 0.71), (s.cx + s.hw * 0.71, s.cy + s.hh * 0.71));
+        let reach = s.cx + s.hw + 80.0;
+        return vec![Route::Curve(a, (reach, s.cy - s.hh - 34.0), (reach, s.cy + s.hh + 34.0), b)];
+    }
     let obj_from = f.kind == Kind::Object && t.kind == Kind::Process;
     let obj_to = f.kind == Kind::Process && t.kind == Kind::Object;
     if !(obj_from || obj_to) || (l.from_state.is_none() && l.to_state.is_none()) {

@@ -1,6 +1,6 @@
 //! MCP tools so ChatGPT (or any MCP client) can build OPM models by name.
 use crate::App;
-use opm_core::{check::check, opl, sim::Sim, sysml, Affiliation, Essence, FanKind, Id, Kind, LinkKind, Model, Modifier, Op};
+use opm_core::{check::check, opl, sim::Sim, sysml, Affiliation, Duration, Essence, FanKind, Id, Kind, LinkKind, Measure, Model, Modifier, Op};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerConfig},
@@ -58,7 +58,16 @@ Link details (add_links fields):
 States: mark the starting state initial_state and end states final_states in add_things.
 Requirements: record what the system must do with add_requirements and trace each one to the things that satisfy it
 (usually a process, sometimes an object). get_model lists them and the checks report untraced ones.
-Verify behavior with simulate(diagram): it runs the diagram's processes top to bottom and says what each consumed,
+Time and quantities (use them whenever the system has timing or sizing requirements):
+- duration={min, expected, max, unit} on a process: 'Publishing takes 5 to 20 ms'. unit: ms, s, min, h, d.
+- overtime / undertime links (process -> handler process): the handler starts if the process runs longer than its max
+  or shorter than its min ('If Publishing lasts more than 20 ms, Alarming occurs').
+- value / min_value / max_value / unit on an object, usually an attribute: 'Latency of Message is 20 ms (allowed: at most
+  50 ms)'. A value outside its range shows up in the checks.
+Loops: an invocation from a process to itself (or to an earlier step) repeats it; give it a condition link that stops
+being true, or it never ends. Alternatives (fan xor/or) can carry probability (0..1) on each link.
+Verify behavior with simulate(diagram): it runs the diagram's processes top to bottom (level ones in parallel), follows
+invocations, loops and time exceptions, picks alternatives by probability, adds up durations, and says what each consumed,
 changed and yielded, or why one couldn't run (a missing input or wrong state usually means a missing link or state).
 Mark physical things physical=true and external ones environmental=true. Every process should transform at least one object
 (consumption, result or effect); avoid things with no links.";
@@ -164,6 +173,20 @@ pub struct ThingSpec {
     /// Objects: list their parts and attributes not drawn in this diagram inside their box (semi-folding).
     #[serde(default)]
     semi_fold: Option<bool>,
+    /// Processes: how long it takes.
+    #[serde(default)]
+    duration: Option<DurationSpec>,
+    /// Objects (usually attributes): the value it holds, e.g. 20.
+    #[serde(default)]
+    value: Option<f64>,
+    /// Objects: the allowed range of the value.
+    #[serde(default)]
+    min_value: Option<f64>,
+    #[serde(default)]
+    max_value: Option<f64>,
+    /// Objects: unit of the value and range, e.g. "ms", "Hz", "PMUs".
+    #[serde(default)]
+    unit: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -194,7 +217,7 @@ pub struct LinkSpec {
     from: String,
     /// Name of the target thing.
     to: String,
-    /// agent | instrument | consumption | result | effect | invocation | aggregation | exhibition | generalization | classification | tagged
+    /// agent | instrument | consumption | result | effect | invocation | overtime | undertime | aggregation | exhibition | generalization | classification | tagged
     kind: String,
     /// Input state of the object end (consumption/instrument/agent/effect).
     #[serde(default)]
@@ -211,6 +234,9 @@ pub struct LinkSpec {
     /// How many of the object/part end: "4", "0..1", "1..*", "2..5", "*".
     #[serde(default)]
     multiplicity: Option<String>,
+    /// Among XOR/OR alternatives (see fan): how likely this one is, 0..1.
+    #[serde(default)]
+    probability: Option<f64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -218,6 +244,22 @@ pub struct LinkRef {
     from: String,
     to: String,
     kind: String,
+    /// Optional: how likely this alternative is, 0..1.
+    #[serde(default)]
+    probability: Option<f64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DurationSpec {
+    #[serde(default)]
+    min: Option<f64>,
+    #[serde(default)]
+    expected: Option<f64>,
+    #[serde(default)]
+    max: Option<f64>,
+    /// ms | s | min | h | d (default ms).
+    #[serde(default)]
+    unit: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -277,6 +319,8 @@ fn link_kind(s: &str, tag: Option<String>) -> Result<LinkKind, String> {
         "result" => Result,
         "effect" => Effect,
         "invocation" => Invocation,
+        "overtime" => Overtime,
+        "undertime" => Undertime,
         "aggregation" => Aggregation,
         "exhibition" => Exhibition,
         "generalization" => Generalization,
@@ -419,6 +463,14 @@ impl Mcp {
                         m.apply(Op::HideState { opd: Some(opd), state: s.id, hidden })?;
                     }
                 }
+                if let Some(d) = &t.duration {
+                    let duration = Duration { min: d.min, expected: d.expected, max: d.max, unit: d.unit.clone().unwrap_or_else(|| "ms".into()) };
+                    m.apply(Op::SetDuration { id, duration: Some(duration) }).map_err(|e| format!("'{}': {e}", t.name))?;
+                }
+                if t.value.is_some() || t.min_value.is_some() || t.max_value.is_some() {
+                    let measure = Measure { value: t.value, min: t.min_value, max: t.max_value, unit: t.unit.clone().unwrap_or_default() };
+                    m.apply(Op::SetMeasure { id, measure: Some(measure) }).map_err(|e| format!("'{}': {e}", t.name))?;
+                }
                 if let Some(on) = t.semi_fold {
                     m.apply(Op::SemiFold { opd: Some(opd), thing: id, on }).map_err(|e| format!("'{}': {e}", t.name))?;
                 }
@@ -471,6 +523,9 @@ impl Mcp {
                     to_state: state_id(m, from, to, &l.to_state)?,
                 };
                 let id = m.apply(op).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
+                if l.probability.is_some() {
+                    m.apply(Op::SetProbability { id, probability: l.probability }).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
+                }
                 if l.modifier.is_some() || l.multiplicity.is_some() {
                     let op = Op::SetLink { id, states: None, modifier: modifier(&l.modifier)?, multiplicity: l.multiplicity.clone() };
                     m.apply(op).map_err(|e| format!("{} -> {}: {e}", l.from, l.to))?;
@@ -499,6 +554,11 @@ impl Mcp {
                 other => return Err(format!("kind must be xor, or, or none; got '{other}'")),
             };
             let links = p.links.iter().map(|l| find_link(m, &l.from, &l.to, &l.kind)).collect::<Result<Vec<_>, _>>()?;
+            for (id, l) in links.iter().zip(&p.links) {
+                if l.probability.is_some() {
+                    m.apply(Op::SetProbability { id: *id, probability: l.probability })?;
+                }
+            }
             m.apply(Op::Fan { links, kind })?;
             Ok(summary(&p.model, m))
         })
@@ -534,7 +594,8 @@ impl Mcp {
         let opd = diagram(&m, &p.diagram)?;
         let mut sim = Sim::new(&m, opd);
         while sim.step(&m) {}
-        let end = if sim.blocked { "Stopped: fix the links or states above, then simulate again." } else { "Finished." };
+        let at = if sim.now > 0.0 { format!(" Total time: {}.", opm_core::sim::fmt_time(sim.now)) } else { String::new() };
+        let end = if sim.blocked { format!("Stopped: fix the links or states above, then simulate again.{at}") } else { format!("Finished.{at}") };
         Ok(format!("Simulation of {}:\n{}\n{end}", m.title(opd), sim.log.join("\n")))
     }
 

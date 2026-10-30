@@ -47,6 +47,19 @@ pub fn export(m: &Model) -> String {
         if !t.states.is_empty() {
             body.push(format!("attribute state : {};", name(&format!("{} State", t.name))));
         }
+        if let Some(d) = t.duration.as_ref().and_then(crate::opl::duration_text) {
+            body.push(format!("// takes {d}"));
+        }
+        if let Some(q) = &t.measure {
+            let unit = if q.unit.is_empty() { String::new() } else { format!(" // {}", q.unit) };
+            if let Some(v) = q.value {
+                body.push(format!("attribute value : ScalarValues::Real = {v};{unit}"));
+            }
+            if q.min.is_some() || q.max.is_some() {
+                let b = |x: Option<f64>| x.map_or("*".to_string(), |v| v.to_string());
+                body.push(format!("// allowed range: {}..{}{}", b(q.min), b(q.max), if q.unit.is_empty() { String::new() } else { format!(" {}", q.unit) }));
+            }
+        }
         for l in m.links.iter().filter(|l| l.from == t.id) {
             let Some(o) = thing(l.to) else { continue };
             match &l.kind {
@@ -54,11 +67,13 @@ pub fn export(m: &Model) -> String {
                 LinkKind::Exhibition => body.push(format!("attribute {} : {}{};", feature(&o.name), name(&o.name), multiplicity(&l.multiplicity))),
                 LinkKind::Tagged(tag) => body.push(format!("// {} {} {}", t.name, if tag.is_empty() { "relates to" } else { tag }, o.name)),
                 LinkKind::Invocation => body.push(format!("// invokes {}", o.name)),
+                LinkKind::Overtime => body.push(format!("// on overtime: {}", o.name)),
+                LinkKind::Undertime => body.push(format!("// on undertime: {}", o.name)),
                 _ => {}
             }
         }
         if t.kind == Kind::Process {
-            for l in m.links.iter().filter(|l| (l.from == t.id || l.to == t.id) && l.kind.is_procedural() && l.kind != LinkKind::Invocation) {
+            for l in m.links.iter().filter(|l| (l.from == t.id || l.to == t.id) && l.kind.is_procedural() && !matches!(l.kind, LinkKind::Invocation | LinkKind::Overtime | LinkKind::Undertime)) {
                 let Some(o) = thing(if l.from == t.id { l.to } else { l.from }) else { continue };
                 let dir = match l.kind {
                     LinkKind::Result => "out",

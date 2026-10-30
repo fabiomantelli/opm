@@ -443,3 +443,13 @@ select.chip.add { appearance: none; cursor: pointer; }
 .chip.state-chip { padding-left: 4px; }
 .chip.state-chip.off > span { opacity: .5; text-decoration: line-through; }
 .chip .eye svg { width: 14px; height: 14px; }
+
+/* Time and quantities */
+.tick { fill: none; stroke: var(--ink); stroke-width: 1.8; stroke-linecap: round; }
+.dur { font-size: 11px; fill: var(--muted); }
+.state.value rect { fill: var(--panel); stroke: var(--obj); }
+.state.value text { fill: var(--ink); font-variant-numeric: tabular-nums; }
+.state.value.bad rect { stroke: var(--danger); stroke-width: 2; }
+.qty-row { display: grid; grid-template-columns: repeat(3, 1fr) 70px; gap: 6px; }
+.qty-row .field-input { padding: 6px; min-width: 0; }
+.sim-clock { font-variant-numeric: tabular-nums; font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--accent-soft); }

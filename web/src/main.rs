@@ -4,7 +4,19 @@ use gloo_net::{http::Request, websocket::{futures::WebSocket, Message}};
 use gloo_timers::future::TimeoutFuture;
 use leptos::{ev, prelude::*, task::spawn_local};
 use canvas::{kind_label, Canvas};
-use opm_core::{layout::size, opl, Affiliation, Essence, FanKind, Id, Kind, LinkKind, Model, Modifier, Op};
+use opm_core::{layout::size, opl, Affiliation, Duration, Essence, FanKind, Id, Kind, LinkKind, Measure, Model, Modifier, Op};
+
+/// A number typed in a field: Some(None) when empty, None when it isn't a number. "70%" is 0.7.
+fn parse_num(s: &str) -> Option<Option<f64>> {
+    let s = s.trim().replace(',', ".");
+    if s.is_empty() {
+        return Some(None);
+    }
+    match s.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f64>().ok().map(|v| Some(v / 100.0)),
+        None => s.parse::<f64>().ok().filter(|v| v.is_finite()).map(Some),
+    }
+}
 
 mod canvas;
 mod files;
@@ -418,7 +430,11 @@ impl Ui {
 
     pub fn simulate(self) {
         let here = self.here();
-        let sim = self.full.with_untracked(|f| f.as_ref().map(|f| opm_core::sim::Sim::new(f, here)));
+        let mut sim = self.full.with_untracked(|f| f.as_ref().map(|f| opm_core::sim::Sim::new(f, here)));
+        // A new draw each run, so alternatives with chances can come out differently.
+        if let (Some(s), Some(p)) = (sim.as_mut(), window().performance()) {
+            s.seed = (p.now() * 1000.0) as u64 | 1;
+        }
         self.playing.set(false);
         self.select(None);
         self.sim.set(sim);
@@ -558,6 +574,71 @@ fn Inspector() -> impl IntoView {
                             }
                         })
                         .collect_view();
+                    // Time (processes) and quantities (objects).
+                    let num_field = move |ph: &'static str, cur: Option<f64>, apply: Box<dyn Fn(Option<f64>) -> Op>| {
+                        view! {
+                            <input class="field-input" placeholder=ph title=ph prop:value=cur.map(|v| v.to_string()).unwrap_or_default()
+                                on:change=move |e| match parse_num(&event_target_value(&e)) {
+                                    Some(v) => ui.send(vec![apply(v)], |_| {}),
+                                    None => ui.say("Type a number"),
+                                } />
+                        }
+                    };
+                    let timing = (!is_obj).then(|| {
+                        let d = t.duration.clone().unwrap_or(Duration { unit: "ms".into(), ..Default::default() });
+                        let with = move |f: fn(&mut Duration, Option<f64>)| {
+                            let d = d.clone();
+                            Box::new(move |v: Option<f64>| {
+                                let mut d = d.clone();
+                                f(&mut d, v);
+                                Op::SetDuration { id, duration: Some(d) }
+                            }) as Box<dyn Fn(Option<f64>) -> Op>
+                        };
+                        let unit_d = t.duration.clone().unwrap_or(Duration { unit: "ms".into(), ..Default::default() });
+                        let cur_unit = unit_d.unit.clone();
+                        view! {
+                            <div class="label">"Duration"</div>
+                            <div class="qty-row">
+                                {num_field("min", unit_d.min, with(|d, v| d.min = v))}
+                                {num_field("expected", unit_d.expected, with(|d, v| d.expected = v))}
+                                {num_field("max", unit_d.max, with(|d, v| d.max = v))}
+                                <select class="field-input" on:change=move |e| {
+                                    let mut d = unit_d.clone();
+                                    d.unit = event_target_value(&e);
+                                    ui.send(vec![Op::SetDuration { id, duration: Some(d) }], |_| {});
+                                }>
+                                    {["ms", "s", "min", "h", "d"].map(|u| view! { <option value=u selected=cur_unit == u>{u}</option> }).collect_view()}
+                                </select>
+                            </div>
+                        }
+                    });
+                    let quantity = is_obj.then(|| {
+                        let q = t.measure.clone().unwrap_or_default();
+                        let with = move |f: fn(&mut Measure, Option<f64>)| {
+                            let q = q.clone();
+                            Box::new(move |v: Option<f64>| {
+                                let mut q = q.clone();
+                                f(&mut q, v);
+                                Op::SetMeasure { id, measure: Some(q) }
+                            }) as Box<dyn Fn(Option<f64>) -> Op>
+                        };
+                        let cur = t.measure.clone().unwrap_or_default();
+                        let unit_q = cur.clone();
+                        view! {
+                            <div class="label">"Value"</div>
+                            <div class="qty-row">
+                                {num_field("value", cur.value, with(|q, v| q.value = v))}
+                                {num_field("min", cur.min, with(|q, v| q.min = v))}
+                                {num_field("max", cur.max, with(|q, v| q.max = v))}
+                                <input class="field-input" placeholder="unit" prop:value=cur.unit.clone()
+                                    on:change=move |e| {
+                                        let mut q = unit_q.clone();
+                                        q.unit = event_target_value(&e);
+                                        ui.send(vec![Op::SetMeasure { id, measure: Some(q) }], |_| {});
+                                    } />
+                            </div>
+                        }
+                    });
                     let set_semi = move |on: bool| ui.send(vec![Op::SemiFold { opd: Some(here), thing: id, on }], |_| {});
                     let semi_row = (is_obj && (has_parts || semi)).then(|| view! {
                         <div class="label">"Parts and attributes here"</div>
@@ -646,6 +727,8 @@ fn Inspector() -> impl IntoView {
                                     <button class="chip add" on:click=move |_| ui.add_state()>"+ state"</button>
                                 </div>
                             })}
+                            {timing}
+                            {quantity}
                             {semi_row}
                             <div class="label">"Satisfies"</div>
                             <div class="chips">{satisfies}</div>
@@ -768,6 +851,15 @@ fn Inspector() -> impl IntoView {
                             let members = members2.clone();
                             move |_| ui.send(vec![Op::Fan { links: members.clone(), kind: k }], |_| {})
                         };
+                        let chance = cur.is_some().then(|| view! {
+                            <label class="label">"Chance"</label>
+                            <input class="field-input" placeholder="an equal share (e.g. 70% or 0.7)"
+                                prop:value=l.probability.map(|p| format!("{}%", (p * 1000.0).round() / 10.0)).unwrap_or_default()
+                                on:change=move |e| match parse_num(&event_target_value(&e)) {
+                                    Some(p) => ui.send(vec![Op::SetProbability { id: lid, probability: p }], |_| {}),
+                                    None => ui.say("Type a chance like 70% or 0.7"),
+                                } />
+                        });
                         view! {
                             <div class="label">"Alternatives with " {others.join(", ")}</div>
                             <div class="seg">
@@ -775,6 +867,7 @@ fn Inspector() -> impl IntoView {
                                 <button class:on=cur == Some(FanKind::Xor) title="Exactly one of them" on:click=pick(Some(FanKind::Xor))>"Either (XOR)"</button>
                                 <button class:on=cur == Some(FanKind::Or) title="At least one of them" on:click=pick(Some(FanKind::Or))>"Or (OR)"</button>
                             </div>
+                            {chance}
                         }
                     });
                     let by_hand = l.route.is_some();
@@ -1112,8 +1205,9 @@ fn SimBar() -> impl IntoView {
         } else if sim.done() {
             "Finished".to_string()
         } else {
-            format!("Next: {} ({}/{})", name(sim.order[sim.next]), sim.next + 1, sim.order.len())
+            format!("Next: {}", sim.upcoming().map(name).unwrap_or_default())
         };
+        let clock = (sim.now > 0.0).then(|| view! { <span class="sim-clock" title="Simulated time">{format!("t = {}", opm_core::sim::fmt_time(sim.now))}</span> });
         let log = sim.log.iter().rev().take(6).rev().cloned().map(|l| view! { <li>{l}</li> }).collect_view();
         let done = sim.done();
         Some(view! {
@@ -1121,6 +1215,7 @@ fn SimBar() -> impl IntoView {
                 <div class="sim-head">
                     <strong>"Simulation"</strong>
                     <span class="muted small">{status}</span>
+                    {clock}
                     <span class="spacer"></span>
                     <button class="ghost-btn" title="Start over" on:click=move |_| ui.simulate()>"Reset"</button>
                     <button class="ghost-btn" disabled=done on:click=move |_| { ui.playing.set(false); ui.sim_step(); }>"Step"</button>

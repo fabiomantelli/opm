@@ -67,6 +67,25 @@ pub fn check(m: &Model) -> Vec<Issue> {
             }
         }
     }
+    // Time and quantities.
+    for t in &m.things {
+        if let Some(q) = &t.measure {
+            let v = q.value.unwrap_or(f64::NAN);
+            if q.min.is_some_and(|a| v < a) || q.max.is_some_and(|b| v > b) {
+                push(home(t.id), format!("{} is {} {}, outside its allowed range.", t.name, v, q.unit), vec![t.id]);
+            }
+        }
+    }
+    for l in m.links.iter().filter(|l| matches!(l.kind, Overtime | Undertime)) {
+        let d = m.thing(l.from).and_then(|p| p.duration.as_ref());
+        let (missing, what) = match l.kind {
+            Overtime => (d.and_then(|d| d.max).is_none(), "a maximum"),
+            _ => (d.and_then(|d| d.min).is_none(), "a minimum"),
+        };
+        if missing {
+            push(home(l.from), format!("{} has a time exception but no {what} duration: set it in its panel.", name(l.from)), vec![l.from, l.to]);
+        }
+    }
     for r in &m.requirements {
         if r.satisfied_by.is_empty() {
             push(m.root(), format!("{} isn't satisfied by anything yet: trace it to the thing that meets it.", r.key), vec![]);

@@ -19,6 +19,31 @@ fn list(items: &[String], conj: &str) -> String {
     }
 }
 
+/// "20 ms", "4 PMUs", "0.5".
+fn qty(v: f64, unit: &str) -> String {
+    if unit.is_empty() { format!("{v}") } else { format!("{v} {unit}") }
+}
+
+/// "5 to 20 ms", "at least 5 ms", "at most 20 ms".
+fn range(min: Option<f64>, max: Option<f64>, unit: &str) -> Option<String> {
+    match (min, max) {
+        (Some(a), Some(b)) => Some(format!("{a} to {}", qty(b, unit))),
+        (Some(a), None) => Some(format!("at least {}", qty(a, unit))),
+        (None, Some(b)) => Some(format!("at most {}", qty(b, unit))),
+        (None, None) => None,
+    }
+}
+
+/// "takes 5 to 20 ms, 10 ms expected".
+pub fn duration_text(d: &crate::Duration) -> Option<String> {
+    match (range(d.min, d.max, &d.unit), d.expected) {
+        (Some(r), Some(e)) => Some(format!("{r}, {} expected", qty(e, &d.unit))),
+        (Some(r), None) => Some(r),
+        (None, Some(e)) => Some(qty(e, &d.unit)),
+        (None, None) => None,
+    }
+}
+
 fn article(word: &str) -> &'static str {
     match word.chars().next().map(|c| c.to_ascii_lowercase()) {
         Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
@@ -106,6 +131,25 @@ pub fn render(m: &Model) -> Vec<Sentence> {
         }
         // An attribute with one state is a value: "Weight of Car is heavy."
         let owner = m.links.iter().find(|l| l.to == t.id && l.kind == LinkKind::Exhibition).map(|l| name(l.from));
+        // Quantities: "Latency of Message is 20 ms (allowed: at most 50 ms)."
+        if let Some(q) = &t.measure {
+            let subject = match &owner {
+                Some(o) => format!("{} of {o}", t.name),
+                None => t.name.clone(),
+            };
+            let text = match (q.value, range(q.min, q.max, &q.unit)) {
+                (Some(v), Some(r)) => format!("{subject} is {} (allowed: {r}).", qty(v, &q.unit)),
+                (Some(v), None) => format!("{subject} is {}.", qty(v, &q.unit)),
+                (None, Some(r)) => format!("{subject} ranges {}.", if r.starts_with("at ") { r } else { format!("from {r}") }),
+                (None, None) => String::new(),
+            };
+            if !text.is_empty() {
+                out.push(Sentence { text, refs: vec![t.id] });
+            }
+        }
+        if let Some(d) = t.duration.as_ref().and_then(duration_text) {
+            out.push(Sentence { text: format!("{} takes {d}.", t.name), refs: vec![t.id] });
+        }
         match (t.states.as_slice(), owner) {
             ([], _) => {}
             (ss, _) if t.more_states => {
@@ -141,7 +185,11 @@ pub fn render(m: &Model) -> Vec<Sentence> {
                 let other = if l.from == end { l.to } else { l.from };
                 let st = if kind == LinkKind::Result { l.to_state } else { l.from_state };
                 let is_obj = m.thing(other).is_some_and(|t| t.kind == Kind::Object);
-                if is_obj { counted(&l.multiplicity, state(st), &name(other)) } else { name(other) }
+                let who = if is_obj { counted(&l.multiplicity, state(st), &name(other)) } else { name(other) };
+                match l.probability {
+                    Some(p) => format!("{who} ({}%)", (p * 1000.0).round() / 10.0),
+                    None => who,
+                }
             })
             .collect();
         let alts = match f.kind {
@@ -222,7 +270,16 @@ pub fn render(m: &Model) -> Vec<Sentence> {
             (LinkKind::Classification, _) => format!("{t} is an instance of {f}."),
             (LinkKind::Tagged(tag), _) if tag.is_empty() => format!("{f} relates to {}.", counted(&l.multiplicity, None, &t)),
             (LinkKind::Tagged(tag), _) => format!("{f} {tag} {}.", counted(&l.multiplicity, None, &t)),
+            (LinkKind::Invocation, _) if l.from == l.to => format!("{f} invokes itself."),
             (LinkKind::Invocation, _) => format!("{f} invokes {t}."),
+            (LinkKind::Overtime, _) => match m.thing(l.from).and_then(|p| Some((p.duration.as_ref()?.max?, p.duration.as_ref()?.unit.clone()))) {
+                Some((max, u)) => format!("If {f} lasts more than {}, {t} occurs.", qty(max, &u)),
+                None => format!("If {f} lasts too long, {t} occurs."),
+            },
+            (LinkKind::Undertime, _) => match m.thing(l.from).and_then(|p| Some((p.duration.as_ref()?.min?, p.duration.as_ref()?.unit.clone()))) {
+                Some((min, u)) => format!("If {f} lasts less than {}, {t} occurs.", qty(min, &u)),
+                None => format!("If {f} ends too soon, {t} occurs."),
+            },
             (LinkKind::Agent, Modifier::None) => format!("{} handles {p}.", obj(None)),
             (LinkKind::Agent, Modifier::Event) => format!("{} initiates and handles {p}.", obj(None)),
             (LinkKind::Agent, Modifier::Condition) => format!("{p} occurs if {cond}, in which case {o} handles {p}, otherwise {p} is skipped."),

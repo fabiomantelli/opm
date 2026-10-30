@@ -635,3 +635,87 @@ fn suppressed_states_and_semi_folded_parts_belong_to_one_diagram() {
     let back: Model = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
     assert_eq!(back.opd(sd).unwrap().semi, vec![car]);
 }
+
+#[test]
+fn time_values_loops_and_chances() {
+    use opm_core::{sim::Sim, Duration, FanKind, Measure, Modifier};
+    let mut m = Model::new("PMU");
+    let at = |m: &mut Model, name: &str, kind: Kind, x: f64, y: f64| {
+        m.apply(Op::AddThing { name: name.into(), kind, essence: Essence::Informatical, affiliation: Default::default(), opd: None, x: Some(x), y: Some(y), inside: None }).unwrap()
+    };
+    let dur = |m: &mut Model, id: u32, min: Option<f64>, expected: Option<f64>, max: Option<f64>| {
+        m.apply(Op::SetDuration { id, duration: Some(Duration { min, expected, max, unit: "ms".into() }) }).unwrap();
+    };
+    let measuring = at(&mut m, "Measuring", Kind::Process, 0.0, 0.0);
+    let filtering = at(&mut m, "Filtering", Kind::Process, 300.0, 0.0);
+    let publishing = at(&mut m, "Publishing", Kind::Process, 0.0, 200.0);
+    let polling = at(&mut m, "Polling", Kind::Process, 0.0, 300.0);
+    let alarming = at(&mut m, "Alarming", Kind::Process, 300.0, 400.0);
+    let classifying = at(&mut m, "Classifying", Kind::Process, 0.0, 500.0);
+    let queue = at(&mut m, "Queue", Kind::Object, 600.0, 300.0);
+    let good = at(&mut m, "Good Frame", Kind::Object, 600.0, 500.0);
+    let bad = at(&mut m, "Bad Frame", Kind::Object, 800.0, 500.0);
+    let message = at(&mut m, "Message", Kind::Object, 600.0, 0.0);
+    let latency = at(&mut m, "Latency", Kind::Object, 800.0, 0.0);
+    dur(&mut m, measuring, None, Some(8.0), None);
+    dur(&mut m, filtering, None, Some(12.0), None);
+    dur(&mut m, publishing, Some(1.0), Some(30.0), Some(20.0));
+    dur(&mut m, alarming, None, Some(5.0), None);
+    dur(&mut m, polling, None, Some(1.0), None);
+    assert!(m.apply(Op::SetDuration { id: queue, duration: Some(Duration { expected: Some(1.0), unit: "ms".into(), ..Default::default() }) }).is_err());
+    assert!(m.apply(Op::SetDuration { id: polling, duration: Some(Duration { expected: Some(1.0), unit: "parsecs".into(), ..Default::default() }) }).is_err());
+
+    // Exception: Publishing takes 30 ms but may take 20.
+    link(&mut m, publishing, alarming, LinkKind::Overtime).unwrap();
+    assert!(link(&mut m, queue, alarming, LinkKind::Overtime).is_err(), "exceptions go between processes");
+    // Loop: Polling runs while Queue is pending, and invokes itself.
+    let pending = m.apply(Op::AddState { thing: queue, name: "pending".into() }).unwrap();
+    let empty = m.apply(Op::AddState { thing: queue, name: "empty".into() }).unwrap();
+    let e = m.apply(Op::AddLink { from: queue, to: polling, kind: LinkKind::Effect, from_state: Some(pending), to_state: Some(empty) }).unwrap();
+    m.apply(Op::SetLink { id: e, states: None, modifier: Some(Modifier::Condition), multiplicity: None }).unwrap();
+    link(&mut m, polling, polling, LinkKind::Invocation).unwrap();
+    assert!(link(&mut m, queue, queue, LinkKind::Aggregation).is_err());
+    // Alternatives with chances.
+    let g = link(&mut m, classifying, good, LinkKind::Result).unwrap();
+    let b = link(&mut m, classifying, bad, LinkKind::Result).unwrap();
+    m.apply(Op::Fan { links: vec![g, b], kind: Some(FanKind::Xor) }).unwrap();
+    m.apply(Op::SetProbability { id: g, probability: Some(1.0) }).unwrap();
+    m.apply(Op::SetProbability { id: b, probability: Some(0.0) }).unwrap();
+    assert!(m.apply(Op::SetProbability { id: b, probability: Some(1.5) }).is_err());
+    // A value outside its range.
+    link(&mut m, message, latency, LinkKind::Exhibition).unwrap();
+    m.apply(Op::SetMeasure { id: latency, measure: Some(Measure { value: Some(60.0), min: None, max: Some(50.0), unit: "ms".into() }) }).unwrap();
+    assert!(m.apply(Op::SetMeasure { id: alarming, measure: Some(Measure { value: Some(1.0), ..Default::default() }) }).is_err());
+
+    let opl: Vec<_> = opl::render(&m.view(m.root())).into_iter().map(|s| s.text).collect();
+    for s in [
+        "Publishing takes 1 to 20 ms, 30 ms expected.",
+        "Latency of Message is 60 ms (allowed: at most 50 ms).",
+        "If Publishing lasts more than 20 ms, Alarming occurs.",
+        "Polling invokes itself.",
+        "Classifying yields either Good Frame (100%) or Bad Frame (0%).",
+    ] {
+        assert!(opl.contains(&s.to_string()), "missing '{s}' in {opl:?}");
+    }
+    let issues = opm_core::check::check(&m);
+    assert!(issues.iter().any(|i| i.text.contains("Latency is 60 ms, outside")), "{issues:?}");
+
+    let mut sim = Sim::new(&m, m.root());
+    assert!(!sim.order.contains(&alarming), "a handler waits for its exception");
+    while sim.step(&m) {}
+    assert!(!sim.blocked, "{:?}", sim.log);
+    let ran: Vec<&str> = sim.log.iter().map(|s| s.as_str()).collect();
+    let pos = |needle: &str| ran.iter().position(|s| s.starts_with(needle)).unwrap_or_else(|| panic!("no '{needle}' in {ran:?}"));
+    assert!(pos("Publishing took longer") < pos("Alarming ran"));
+    assert!(pos("Polling runs again") < pos("Polling skipped"), "the loop ends when its condition fails");
+    assert!(ran.iter().any(|s| s.contains("yielded Good Frame")) && !ran.iter().any(|s| s.contains("Bad Frame")));
+    // 12 ms (Measuring and Filtering in parallel) + 30 + 5 + 1 = 48 ms.
+    assert!((sim.now - 0.048).abs() < 1e-9, "{} {:?}", sim.now, sim.log);
+
+    // An endless loop stops.
+    m.apply(Op::Remove { id: e }).unwrap();
+    let mut sim = Sim::new(&m, m.root());
+    while sim.step(&m) {}
+    assert!(sim.blocked && sim.log.last().unwrap().contains("loop never ends"));
+    m.validate().unwrap();
+}

@@ -1,10 +1,10 @@
 //! The diagram: geometry, hit-testing, pointer/keyboard interaction, and the floating UI on the canvas.
 pub use crate::routes::LinkStyle;
-use crate::routes::{arc_of, clip, dist, more_box, pill_or_body, point_at, seg, shape_of, state_boxes, LinkGeo, Route, Routes};
+use crate::routes::{arc_of, clip, dist, more_box, pill_or_body, value_box, point_at, seg, shape_of, state_boxes, LinkGeo, Route, Routes};
 use crate::{storage, ui, Drag, Menu, Sel, Target, Ui, P};
 use leptos::{ev, prelude::*};
 use opm_core::{
-    layout::{frame_label_y, label_y, part_label, size, MORE, PARTS_TOP, PART_ROW},
+    layout::{duration_label, frame_label_y, label_y, part_label, size, value_label, value_out_of_range, MORE, PARTS_TOP, PART_ROW},
     opl, valid_link_kinds, Affiliation, Essence, FanKind, Id, Kind, Link, LinkKind, Model, Modifier, Op, Thing,
 };
 use wasm_bindgen::JsCast;
@@ -117,6 +117,8 @@ pub fn kind_label(k: &LinkKind) -> &'static str {
         LinkKind::Result => "Result",
         LinkKind::Effect => "Effect",
         LinkKind::Invocation => "Invocation",
+        LinkKind::Overtime => "Overtime exception",
+        LinkKind::Undertime => "Undertime exception",
         LinkKind::Aggregation => "Aggregation",
         LinkKind::Exhibition => "Exhibition",
         LinkKind::Generalization => "Generalization",
@@ -177,6 +179,8 @@ impl Ui {
             essence: Essence::Informatical,
             affiliation: Affiliation::Systemic,
             states: vec![],
+            duration: None,
+            measure: None,
             x: 0.0,
             y: 0.0,
             auto: false,
@@ -829,7 +833,7 @@ fn marker_ends(k: &LinkKind, pair: bool) -> (Option<&'static str>, Option<&'stat
     match k {
         LinkKind::Agent => (None, Some("url(#dot)")),
         LinkKind::Instrument => (None, Some("url(#ring)")),
-        LinkKind::Consumption | LinkKind::Result | LinkKind::Invocation => (None, Some("url(#arrow)")),
+        LinkKind::Consumption | LinkKind::Result | LinkKind::Invocation | LinkKind::Overtime | LinkKind::Undertime => (None, Some("url(#arrow)")),
         LinkKind::Effect if pair => (None, Some("url(#arrow)")),
         LinkKind::Effect => (Some("url(#arrow)"), Some("url(#arrow)")),
         LinkKind::Tagged(_) => (None, Some("url(#open)")),
@@ -853,6 +857,9 @@ fn symbol(k: &LinkKind) -> Option<AnyView> {
             <circle cx="-1" cy="0" r="3.6" class="sym fill" />
         }
         .into_any(),
+        // Time exceptions: one bar across the link (overtime), two (undertime).
+        LinkKind::Overtime => view! { <path d="M0,-8 L0,8" class="tick" /> }.into_any(),
+        LinkKind::Undertime => view! { <path d="M-3,-8 L-3,8 M3,-8 L3,8" class="tick" /> }.into_any(),
         _ => return None,
     })
 }
@@ -1021,6 +1028,16 @@ fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>, now: Option<Id>) -> A
             }
         })
         .collect_view();
+    let value = value_box(t).zip(value_label(t)).map(|((x, y, sw, sh), label)| view! {
+        <g class=if value_out_of_range(t) { "state value bad" } else { "state value" }>
+            <title>{if value_out_of_range(t) { "Outside its allowed range" } else { "Its value" }}</title>
+            <rect x=x y=y width=sw height=sh rx="5" />
+            <text x=x + sw / 2.0 y=y + sh / 2.0 text-anchor="middle" dominant-baseline="central">{label}</text>
+        </g>
+    });
+    let dur = duration_label(t).map(|d| view! {
+        <text class="dur" x=t.x + w / 2.0 y=label_y + 18.0 text-anchor="middle" dominant-baseline="central">{d}</text>
+    });
     let more = more_box(t).map(|(x, y, sw, sh)| view! {
         <g class="state more">
             <title>"More states, hidden in this diagram (see the inspector)"</title>
@@ -1056,6 +1073,8 @@ fn thing_view(t: &Thing, cls: &str, sel_state: Option<Id>, now: Option<Id>) -> A
             {parts}
             {states}
             {more}
+            {value}
+            {dur}
             {t.detail.is_some().then(|| view! { <title>"Double-click to open its detail diagram"</title> })}
         </g>
     }
@@ -1095,8 +1114,8 @@ pub fn Canvas() -> impl IntoView {
                                 None => cls += " absent",
                             },
                             Kind::Process if sim.last == Some(t.id) => cls += " ran",
-                            Kind::Process if sim.order.get(sim.next) == Some(&t.id) && !sim.blocked => cls += " upnext",
-                            Kind::Process if sim.blocked && sim.order.get(sim.next) == Some(&t.id) => cls += " stuck",
+                            Kind::Process if sim.upcoming() == Some(t.id) && !sim.blocked => cls += " upnext",
+                            Kind::Process if sim.blocked && sim.upcoming() == Some(t.id) => cls += " stuck",
                             _ => {}
                         }
                     }
@@ -1128,7 +1147,7 @@ pub fn Canvas() -> impl IntoView {
                         t.state_order,
                         t.more_states,
                         t.parts,
-                    );
+                    ) + &format!("|{:?}|{:?}", t.duration, t.measure);
                     (key, t.clone(), cls, ss, now)
                 })
                 .collect::<Vec<_>>()
@@ -1437,6 +1456,18 @@ fn ContextBar() -> impl IntoView {
                             <button class="ctx-btn" title="Add state (S)" on:click=move |_| ui.add_state()>
                                 <svg viewBox="0 0 24 24"><rect x="3" y="8" width="13" height="8" rx="4" class="ic state" /><path d="M19 9v6M16 12h6" class="ic line" /></svg>
                             </button>
+                        })}
+                        {(!is_obj).then(|| {
+                            let looped = m.links.iter().find(|l| l.from == id && l.to == id).map(|l| l.id);
+                            view! {
+                                <button class="ctx-btn" class:on=looped.is_some() title="Loop: it invokes itself (repeats while its conditions hold)"
+                                    on:click=move |_| ui.send(vec![match looped {
+                                        Some(lid) => Op::Remove { id: lid },
+                                        None => Op::AddLink { from: id, to: id, kind: LinkKind::Invocation, from_state: None, to_state: None },
+                                    }], |_| {})>
+                                    <svg viewBox="0 0 24 24"><path d="M19 12a7 7 0 1 1-2.1-5" class="ic line" /><path d="M17.5 2.5v4.5H13" class="ic line" /></svg>
+                                </button>
+                            }
                         })}
                         {refine}
                         <span class="ctx-sep"></span>
