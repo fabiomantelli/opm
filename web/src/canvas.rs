@@ -1,6 +1,6 @@
 //! The diagram: geometry, hit-testing, pointer/keyboard interaction, and the floating UI on the canvas.
 pub use crate::routes::LinkStyle;
-use crate::routes::{clip, dist, pill_or_body, seg, shape_of, state_boxes, LinkGeo, Route, Routes};
+use crate::routes::{arc_of, clip, dist, pill_or_body, point_at, seg, shape_of, state_boxes, LinkGeo, Route, Routes};
 use crate::{storage, ui, Drag, Menu, Sel, Target, Ui, P};
 use leptos::{ev, prelude::*};
 use opm_core::{
@@ -29,15 +29,53 @@ pub enum Hit {
     State(Id, Id),
     Thing(Id),
     Link(Id),
+    /// A handle on the selected link.
+    Handle(Id, Handle),
 }
 
 impl Hit {
     fn thing(self) -> Option<Id> {
         match self {
             Hit::Port(id) | Hit::State(id, _) | Hit::Thing(id) => Some(id),
-            Hit::Link(_) => None,
+            Hit::Link(_) | Hit::Handle(..) => None,
         }
     }
+}
+
+/// Grips on a selected link for shaping it by hand.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Handle {
+    /// The `from` (false) or `to` (true) end: slides along its thing's border.
+    End(bool),
+    /// A point the link passes through (double-click removes it).
+    Bend(usize),
+    /// Between two points: dragging it adds a point there.
+    Add(usize),
+}
+
+/// The handles of link `lid` and where they are. Effects drawn in two pieces have none (they stay automatic).
+pub fn link_handles(m: &Model, routes: &Routes, lid: Id) -> Vec<(Handle, P)> {
+    let (Some(l), Some(g)) = (m.links.iter().find(|l| l.id == lid), routes.links.get(&lid)) else { return vec![] };
+    let [path] = g.pts.as_slice() else { return vec![] };
+    let (p0, q) = (path[0], *path.last().unwrap());
+    let bends: Vec<P> = l.route.as_ref().map(|r| r.points.clone()).unwrap_or_default();
+    // Ends on a state pill stay on the pill.
+    let pill = |end: Id| m.thing(end).is_some_and(|t| t.kind == Kind::Object) && (l.from_state.is_some() || l.to_state.is_some());
+    let mut out = vec![];
+    if !pill(l.from) {
+        out.push((Handle::End(false), p0));
+    }
+    if !pill(l.to) {
+        out.push((Handle::End(true), q));
+    }
+    let ctrl: Vec<f64> = std::iter::once(0.0).chain(bends.iter().map(|&b| arc_of(path, b))).chain([arc_of(path, q)]).collect();
+    for (i, w) in ctrl.windows(2).enumerate() {
+        if w[1] - w[0] > 36.0 {
+            out.push((Handle::Add(i), point_at(path, (w[0] + w[1]) / 2.0)));
+        }
+    }
+    out.extend(bends.into_iter().enumerate().map(|(i, b)| (Handle::Bend(i), b)));
+    out
 }
 
 /// What is under `p`; ports count only on the things in `with_ports`; links only when `routes` is given.
@@ -266,10 +304,31 @@ impl Ui {
         }
     }
 
-    /// Moves things locally right away, then persists (one undo step).
+    /// Moves things locally right away, then persists (one undo step). A hand-shaped link whose two ends
+    /// both move goes along with them.
     fn move_things(self, moves: Vec<(Id, f64, f64)>) {
+        let opd = Some(self.here());
+        let mut route_ops = vec![];
         self.model.update(|m| {
             if let Some(m) = m.as_mut() {
+                let delta = |id: Id| {
+                    let (_, x, y) = moves.iter().find(|mv| mv.0 == id)?;
+                    m.thing(id).map(|t| (x - t.x, y - t.y))
+                };
+                let shifts: Vec<(Id, P)> = m
+                    .links
+                    .iter()
+                    .filter(|l| l.route.is_some() && delta(l.to).is_some())
+                    .filter_map(|l| Some((l.id, delta(l.from)?)))
+                    .collect();
+                for (lid, (dx, dy)) in shifts {
+                    if let Some(r) = m.links.iter_mut().find(|l| l.id == lid).and_then(|l| l.route.as_mut()) {
+                        for p in &mut r.points {
+                            (p.0, p.1) = (p.0 + dx, p.1 + dy);
+                        }
+                        route_ops.push(Op::SetRoute { opd, link: lid, points: r.points.clone(), from: r.from, to: r.to });
+                    }
+                }
                 for &(id, x, y) in &moves {
                     if let Some(t) = m.things.iter_mut().find(|t| t.id == id) {
                         (t.x, t.y, t.auto) = (x, y, false);
@@ -278,8 +337,39 @@ impl Ui {
                 m.refit_frame();
             }
         });
-        let opd = Some(self.here());
-        self.send(moves.into_iter().map(|(id, x, y)| Op::Move { opd, id, x, y, auto: false }).collect(), |_| {});
+        let mut ops: Vec<Op> = moves.into_iter().map(|(id, x, y)| Op::Move { opd, id, x, y, auto: false }).collect();
+        ops.extend(route_ops);
+        self.send(ops, |_| {});
+    }
+
+    /// The handle of the selected link under `p`.
+    fn handle_at(self, p: P) -> Option<(Id, Handle)> {
+        let Some(Sel::Link(lid)) = self.sel.get_untracked() else { return None };
+        let tol = 8.0 / self.view.get_untracked().2.min(1.5);
+        let routes = self.routes.get_untracked();
+        self.model.with_untracked(|m| {
+            let hs = link_handles(m.as_ref()?, &routes, lid);
+            // Bends and ends before the add-grips between them.
+            hs.iter()
+                .filter(|(h, at)| !matches!(h, Handle::Add(_)) && dist(*at, p) < tol)
+                .chain(hs.iter().filter(|(h, at)| matches!(h, Handle::Add(_)) && dist(*at, p) < tol))
+                .next()
+                .map(|(h, _)| (lid, *h))
+        })
+    }
+
+    /// The link drawn automatically again in this diagram.
+    pub fn reset_route(self, lid: Id) {
+        self.send(vec![Op::SetRoute { opd: Some(self.here()), link: lid, points: vec![], from: None, to: None }], |_| {});
+    }
+
+    /// Shows a route being shaped, before it's saved.
+    fn preview_route(self, r: &opm_core::Route) {
+        self.model.update(|m| {
+            if let Some(l) = m.as_mut().and_then(|m| m.links.iter_mut().find(|l| l.id == r.link)) {
+                l.route = Some(r.clone());
+            }
+        });
     }
 
     /// Full layout of this diagram; the layout then owns every position again (automatic arranging may move them).
@@ -381,6 +471,9 @@ impl Ui {
             pan
         } else if e.button() != 0 {
             return;
+        } else if let Some((link, handle)) = self.handle_at(p) {
+            let route = m.links.iter().find(|l| l.id == link).and_then(|l| l.route.clone()).unwrap_or(opm_core::Route { link, ..Default::default() });
+            Drag::Route { link, handle, route, moved: false }
         } else {
             match hit(&m, &self.port_things(), p, z, Some(&self.routes.get_untracked())) {
                 Some(Hit::Port(id)) => Drag::Link { from: id, state: None, at: p, moved: false, target: None },
@@ -408,6 +501,7 @@ impl Ui {
                     Drag::Move { start: p, orig, primary: id, snap: m.clone(), moved: false, guides: vec![] }
                 }
                 Some(Hit::Link(id)) => return self.select(Some(Sel::Link(id))),
+                Some(Hit::Handle(..)) => return,
                 None => {
                     let base = if e.shift_key() { self.group.get_untracked() } else { vec![] };
                     self.select_things(base.clone());
@@ -429,7 +523,7 @@ impl Ui {
             // Idle: track what is under the pointer for hover affordances.
             let routes = self.routes.get_untracked();
             let ports = self.port_things();
-            let h = self.model.with_untracked(|m| m.as_ref().and_then(|m| hit(m, &ports, p, z, Some(&routes))));
+            let h = self.handle_at(p).map(|(l, h)| Hit::Handle(l, h)).or_else(|| self.model.with_untracked(|m| m.as_ref().and_then(|m| hit(m, &ports, p, z, Some(&routes)))));
             if h != self.hot.get_untracked() {
                 self.hot.set(h);
             }
@@ -485,6 +579,7 @@ impl Ui {
                     }
                 }
                 let moves: Vec<_> = orig.iter().map(|&(id, x, y)| (id, (x + dx).round(), (y + dy).round())).collect();
+                let (rdx, rdy) = (dx.round(), dy.round());
                 self.model.update(|m| {
                     if let Some(m) = m.as_mut() {
                         for &(id, x, y) in &moves {
@@ -492,9 +587,62 @@ impl Ui {
                                 (t.x, t.y) = (x, y);
                             }
                         }
+                        // Hand-shaped links between moving things travel with them.
+                        for l in m.links.iter_mut().filter(|l| moving.contains(&l.from) && moving.contains(&l.to)) {
+                            let before = snap.links.iter().find(|o| o.id == l.id).and_then(|o| o.route.as_ref());
+                            if let (Some(r), Some(b)) = (l.route.as_mut(), before) {
+                                r.points = b.points.iter().map(|p| (p.0 + rdx, p.1 + rdy)).collect();
+                            }
+                        }
                         m.refit_frame();
                     }
                 });
+            }
+            Drag::Route { link, handle, route, moved } => {
+                *moved = true;
+                let p = (p.0.round(), p.1.round());
+                let tol = 6.0 / z;
+                // Snap a point in line with its neighbors, so straight runs are easy.
+                let snap_to = |p: P, near: &[P]| {
+                    let mut p = p;
+                    for n in near {
+                        if (p.0 - n.0).abs() < tol {
+                            p.0 = n.0;
+                        }
+                        if (p.1 - n.1).abs() < tol {
+                            p.1 = n.1;
+                        }
+                    }
+                    p
+                };
+                let ends = self.routes.with_untracked(|r| r.links.get(link).and_then(|g| Some((*g.pts.first()?.first()?, *g.pts.first()?.last()?))));
+                let ctrl = |pts: &[P]| -> Vec<P> { ends.map(|(a, b)| std::iter::once(a).chain(pts.iter().copied()).chain([b]).collect()).unwrap_or_default() };
+                match *handle {
+                    Handle::Add(i) => {
+                        let i = i.min(route.points.len());
+                        route.points.insert(i, p);
+                        *handle = Handle::Bend(i);
+                    }
+                    Handle::Bend(i) if i < route.points.len() => {
+                        let c = ctrl(&route.points);
+                        let near: Vec<P> = [c.get(i), c.get(i + 2)].into_iter().flatten().copied().collect();
+                        route.points[i] = snap_to(p, &near);
+                    }
+                    Handle::End(to) => {
+                        let lk = self.model.with_untracked(|m| m.as_ref().and_then(|m| m.links.iter().find(|l| l.id == *link).map(|l| if to { l.to } else { l.from })));
+                        let t = lk.and_then(|id| self.model.with_untracked(|m| m.as_ref().and_then(|m| m.thing(id).cloned())));
+                        if let Some(t) = t {
+                            // The border point toward the pointer, as a fraction of the box.
+                            let (w, h) = size(&t);
+                            let b = clip(&shape_of(&t), p);
+                            let frac = |v: f64| (v.clamp(0.0, 1.0) * 1000.0).round() / 1000.0;
+                            let a = Some((frac((b.0 - t.x) / w), frac((b.1 - t.y) / h)));
+                            if to { route.to = a } else { route.from = a }
+                        }
+                    }
+                    Handle::Bend(_) => {}
+                }
+                self.preview_route(route);
             }
             Drag::Link { from, at, moved, target, .. } => {
                 *at = p;
@@ -533,6 +681,11 @@ impl Ui {
         let (local, p) = self.to_model(e.client_x(), e.client_y());
         match d {
             Drag::Pan { .. } | Drag::Marquee { .. } => {}
+            Drag::Route { link, route, moved, .. } => {
+                if moved {
+                    self.send(vec![Op::SetRoute { opd: Some(self.here()), link, points: route.points, from: route.from, to: route.to }], |_| {});
+                }
+            }
             Drag::Move { orig, moved, .. } => {
                 if moved {
                     let m = self.model.get_untracked().unwrap();
@@ -553,6 +706,18 @@ impl Ui {
     fn double_click(self, e: ev::MouseEvent) {
         let (_, p) = self.to_model(e.client_x(), e.client_y());
         let Some(m) = self.model.get_untracked() else { return };
+        if let Some((lid, h)) = self.handle_at(p) {
+            let Some(mut r) = m.links.iter().find(|l| l.id == lid).and_then(|l| l.route.clone()) else { return };
+            match h {
+                Handle::Bend(i) if i < r.points.len() => {
+                    r.points.remove(i);
+                }
+                Handle::End(true) => r.to = None,
+                Handle::End(false) => r.from = None,
+                _ => return,
+            }
+            return self.send(vec![Op::SetRoute { opd: Some(self.here()), link: lid, points: r.points, from: r.from, to: r.to }], |_| {});
+        }
         match hit(&m, &[], p, self.view.get_untracked().2, Some(&self.routes.get_untracked())) {
             Some(Hit::Thing(id)) => match m.thing(id).and_then(|t| t.detail) {
                 Some(d) => self.go(d),
@@ -997,7 +1162,27 @@ pub fn Canvas() -> impl IntoView {
                 ),
                 _ => None,
             };
-            Some(view! { {port_views}{overlay} })
+            // Grips on the selected link (and while it's being shaped).
+            let shaping = match &drag {
+                Some(Drag::Route { link, .. }) => Some(*link),
+                None => match ui.sel.get() {
+                    Some(Sel::Link(l)) => Some(l),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let grips = shaping
+                .map(|lid| {
+                    link_handles(m, &ui.routes.get(), lid)
+                        .into_iter()
+                        .map(|(h, (x, y))| match h {
+                            Handle::End(_) => view! { <circle class="grip end" cx=x cy=y r="5" /> }.into_any(),
+                            Handle::Bend(_) => view! { <rect class="grip bend" x=x - 5.0 y=y - 5.0 width="10" height="10" rx="2" /> }.into_any(),
+                            Handle::Add(_) => view! { <circle class="grip add" cx=x cy=y r="4.5" /> }.into_any(),
+                        })
+                        .collect_view()
+                });
+            Some(view! { {port_views}{overlay}{grips} })
         })
     };
     let transform = move || {
@@ -1018,6 +1203,8 @@ pub fn Canvas() -> impl IntoView {
             (None, Some(Hit::Port(_) | Hit::State(..))) => "linking",
             (None, Some(Hit::Thing(_))) => "movable",
             (None, Some(Hit::Link(_))) => "pointing",
+            (None, Some(Hit::Handle(..))) => "movable",
+            (Some(Drag::Route { .. }), _) => "moving",
             _ => "",
         };
         format!("canvas {c}")
@@ -1206,7 +1393,8 @@ fn ContextBar() -> impl IntoView {
             }
             Sel::Link(lid) => {
                 let l = m.links.iter().find(|l| l.id == lid)?.clone();
-                let ((mx, my), _) = ui.routes.get().links.get(&lid)?.mid;
+                // Above the whole link, so it never covers the grips used to shape it.
+                let (((mx, _), _), top) = ui.routes.get().links.get(&lid).map(|g| (g.mid, g.bbox.1))?;
                 let (f, t) = (m.thing(l.from)?, m.thing(l.to)?);
                 let kinds = valid_link_kinds(f.kind, t.kind)
                     .into_iter()
@@ -1227,10 +1415,17 @@ fn ContextBar() -> impl IntoView {
                         }
                     })
                     .collect_view();
+                let reset = l.route.is_some().then(|| view! {
+                    <span class="ctx-sep"></span>
+                    <button class="ctx-btn" title="Reset route: draw it automatically again" on:click=move |_| ui.reset_route(lid)>
+                        <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4.5h4.5" class="ic line" /></svg>
+                    </button>
+                });
                 Some(bar(
-                    (mx, my - 14.0),
+                    (mx, top - 6.0),
                     view! {
                         {kinds}
+                        {reset}
                         <span class="ctx-sep"></span>
                         <button class="ctx-btn danger-ic" title="Delete (Del)" on:click=move |_| ui.remove_selected()>{icon_trash()}</button>
                     }

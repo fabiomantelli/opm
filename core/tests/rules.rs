@@ -502,3 +502,25 @@ fn requirements_simulation_and_sysml() {
     }
     let _ = r2;
 }
+
+#[test]
+fn hand_routes_belong_to_one_diagram_and_go_with_their_link() {
+    let mut m = Model::new("Routes");
+    let a = add(&mut m, "Water", Kind::Object);
+    let p = add(&mut m, "Boiling", Kind::Process);
+    let l = link(&mut m, a, p, LinkKind::Consumption).unwrap();
+    let sd1 = m.apply(Op::Refine { thing: p, unfold: false, from: None }).unwrap();
+    m.apply(Op::SetRoute { opd: None, link: l, points: vec![(10.0, 20.0)], from: Some((1.0, 0.5)), to: None }).unwrap();
+    assert_eq!(m.view(m.root()).links[0].route.as_ref().unwrap().points, [(10.0, 20.0)]);
+    assert!(m.view(sd1).links.iter().all(|x| x.route.is_none()), "only in the SD");
+    assert!(m.apply(Op::SetRoute { opd: None, link: l, points: vec![(f64::NAN, 0.0)], from: None, to: None }).is_err());
+    let back: Model = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+    back.validate().unwrap();
+    assert_eq!(back.opds[0].routes, m.opds[0].routes);
+    // Nothing left = automatic again.
+    m.apply(Op::SetRoute { opd: None, link: l, points: vec![], from: None, to: None }).unwrap();
+    assert!(m.opds[0].routes.is_empty());
+    m.apply(Op::SetRoute { opd: None, link: l, points: vec![(1.0, 2.0)], from: None, to: None }).unwrap();
+    m.apply(Op::Remove { id: l }).unwrap();
+    assert!(m.opds[0].routes.is_empty(), "the route goes with its link");
+}

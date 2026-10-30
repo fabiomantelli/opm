@@ -58,6 +58,8 @@ pub enum Drag {
     Move { start: P, orig: Vec<(Id, f64, f64)>, primary: Id, snap: Model, moved: bool, guides: Vec<(P, P)> },
     Link { from: Id, state: Option<Id>, at: P, moved: bool, target: Option<(Id, Option<Id>)> },
     Marquee { start: P, at: P, base: Vec<Id> },
+    /// Shaping a link by hand: the handle held and the route as it is now.
+    Route { link: Id, handle: canvas::Handle, route: opm_core::Route, moved: bool },
 }
 
 #[derive(Clone)]
@@ -730,10 +732,19 @@ fn Inspector() -> impl IntoView {
                             </div>
                         }
                     });
+                    let by_hand = l.route.is_some();
+                    let route = view! {
+                        <div class="label">"Route"</div>
+                        <div class="route-row">
+                            <span class="muted small">{if by_hand { "Shaped by hand" } else { "Automatic — drag the dots on the link to shape it" }}</span>
+                            {by_hand.then(|| view! { <button class="ghost-btn" on:click=move |_| ui.reset_route(lid)>"Reset"</button> })}
+                        </div>
+                    };
                     view! {
                         <section class="inspector">
                             <div class="eyebrow"><span class="dot link"></span>{label} " link"</div>
                             <p class="sentence">{sentence}</p>
+                            {route}
                             {pickers}
                             {modifier}
                             {count}
@@ -1466,7 +1477,7 @@ fn App() -> impl IntoView {
         &storage().and_then(|s| s.get_item("opm-link-style").ok().flatten()).unwrap_or_default(),
     ));
     // Only flips when a move-drag starts or ends, so routes don't recompute on every drag event.
-    let moving = Memo::new(move |_| drag.with(|d| matches!(d, Some(Drag::Move { .. }))));
+    let moving = Memo::new(move |_| drag.with(|d| matches!(d, Some(Drag::Move { .. } | Drag::Route { .. }))));
     let ui = Ui {
         mid: RwSignal::new(hash_parts().0),
         full: RwSignal::new(None),

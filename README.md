@@ -41,6 +41,16 @@ Ao iniciar, o servidor imprime o endereço do editor e a URL do MCP (com o token
 - `Del`: se o item aparece em outros diagramas, sai só deste; senão é apagado do modelo
   (o painel do item também tem "Delete from the whole model").
 - Estilo das setas (reta / curva / ângulo reto) no canto inferior direito; em ângulo reto elas desviam dos itens.
+- **Linhas**: são traçadas sozinhas — saem dos estados por baixo, sem cruzar o objeto, e as que dividem o
+  mesmo corredor ficam afastadas. Para ajustar uma, selecione-a:
+  - arraste o **círculo vazado** no meio de um trecho para criar um ponto de passagem (em ângulo reto,
+    isso desliza o trecho); arraste o **quadrado** para mover o ponto; **duplo clique** no quadrado o remove;
+  - arraste o **círculo da ponta** ao longo da borda do item para escolher por onde a linha entra;
+    duplo clique na ponta volta ao automático;
+  - **↺ Reset route** (na barra ou no painel) volta tudo ao automático.
+
+  O ajuste vale só para aquele diagrama, acompanha os itens quando você os move juntos e não é desfeito
+  pelo ChatGPT nem pelo *Tidy*. Efeitos com estado de entrada e de saída (duas setas) ficam automáticos.
 - **`Ctrl+K`** (ou `/`, ou o botão *Find*): busca qualquer item, estado ou diagrama no modelo inteiro;
   `Enter` abre o diagrama certo, centraliza e seleciona o item.
 

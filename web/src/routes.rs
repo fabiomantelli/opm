@@ -113,6 +113,25 @@ pub enum Route {
     Curve(P, P, P, P),
     /// Right-angle polyline.
     Ortho(Vec<P>),
+    /// Smooth curve through these points (a hand-shaped curved link).
+    Spline(Vec<P>),
+}
+
+/// Catmull-Rom through `pts` as cubic Bézier pieces: (start, control 1, control 2, end).
+fn spline_pieces(pts: &[P]) -> Vec<(P, P, P, P)> {
+    let n = pts.len();
+    (0..n.saturating_sub(1))
+        .map(|i| {
+            let (p0, p1, p2, p3) = (pts[i.saturating_sub(1)], pts[i], pts[i + 1], pts[(i + 2).min(n - 1)]);
+            (p1, (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0), (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0), p2)
+        })
+        .collect()
+}
+
+fn bezier(a: P, c1: P, c2: P, b: P, t: f64) -> P {
+    let u = 1.0 - t;
+    let f = |a: f64, b: f64, c: f64, d: f64| u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d;
+    (f(a.0, c1.0, c2.0, b.0), f(a.1, c1.1, c2.1, b.1))
 }
 
 impl Route {
@@ -132,6 +151,13 @@ impl Route {
             Route::Line(a, b) => format!("M{:.1},{:.1} L{:.1},{:.1}", a.0, a.1, b.0, b.1),
             Route::Curve(a, c1, c2, b) => {
                 format!("M{:.1},{:.1} C{:.1},{:.1} {:.1},{:.1} {:.1},{:.1}", a.0, a.1, c1.0, c1.1, c2.0, c2.1, b.0, b.1)
+            }
+            Route::Spline(pts) => {
+                let mut d = format!("M{:.1},{:.1}", pts[0].0, pts[0].1);
+                for (_, c1, c2, b) in spline_pieces(pts) {
+                    d += &format!(" C{:.1},{:.1} {:.1},{:.1} {:.1},{:.1}", c1.0, c1.1, c2.0, c2.1, b.0, b.1);
+                }
+                d
             }
             Route::Ortho(pts) => {
                 // Rounded corners.
@@ -160,14 +186,14 @@ impl Route {
         match self {
             Route::Line(a, b) => vec![*a, *b],
             Route::Ortho(pts) => pts.clone(),
-            Route::Curve(a, c1, c2, b) => (0..=16)
-                .map(|i| {
-                    let t = i as f64 / 16.0;
-                    let u = 1.0 - t;
-                    let f = |a: f64, b: f64, c: f64, d: f64| u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * c + t * t * t * d;
-                    (f(a.0, c1.0, c2.0, b.0), f(a.1, c1.1, c2.1, b.1))
-                })
-                .collect(),
+            Route::Curve(a, c1, c2, b) => (0..=16).map(|i| bezier(*a, *c1, *c2, *b, i as f64 / 16.0)).collect(),
+            Route::Spline(pts) => {
+                let mut out = vec![pts[0]];
+                for (a, c1, c2, b) in spline_pieces(pts) {
+                    out.extend((1..=12).map(|i| bezier(a, c1, c2, b, i as f64 / 12.0)));
+                }
+                out
+            }
         }
     }
 }
@@ -186,6 +212,35 @@ pub fn mid_and_angle(pts: &[P]) -> (P, f64) {
         left -= l;
     }
     (pts[0], 0.0)
+}
+
+/// How far along `path` the point nearest `p` is.
+pub fn arc_of(path: &[P], p: P) -> f64 {
+    let (mut best, mut at, mut run) = (f64::MAX, 0.0, 0.0);
+    for w in path.windows(2) {
+        let l = dist(w[0], w[1]);
+        let d = dist_to_seg(p, (w[0], w[1]));
+        if d < best {
+            let t = if l > 0.0 { (((p.0 - w[0].0) * (w[1].0 - w[0].0) + (p.1 - w[0].1) * (w[1].1 - w[0].1)) / (l * l)).clamp(0.0, 1.0) } else { 0.0 };
+            (best, at) = (d, run + t * l);
+        }
+        run += l;
+    }
+    at
+}
+
+/// The point `s` along `path`.
+pub fn point_at(path: &[P], s: f64) -> P {
+    let mut left = s;
+    for w in path.windows(2) {
+        let l = dist(w[0], w[1]);
+        if left <= l && l > 0.0 {
+            let t = left / l;
+            return (w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t);
+        }
+        left -= l;
+    }
+    *path.last().unwrap_or(&(0.0, 0.0))
 }
 
 /// Which side of `a` faces `b`: (vertical?, direction sign).
@@ -472,6 +527,8 @@ pub struct Routes {
     pub links: HashMap<Id, Arc<LinkGeo>>,
     /// Routes before nudging, to reuse while dragging.
     raw: HashMap<Id, Vec<Route>>,
+    /// Hand-shaped routes at compute time.
+    hand: HashMap<Id, opm_core::Route>,
     /// Box and state count per thing at compute time.
     boxes: HashMap<Id, (Rect, usize)>,
     link_ids: Vec<Id>,
@@ -514,8 +571,12 @@ impl Routes {
             for id in &moved {
                 near.extend(adj.get(id).into_iter().flatten().map(|&(_, o)| o));
             }
-            near.iter().flat_map(|id| adj.get(id).into_iter().flatten().map(|&(lid, _)| lid)).collect()
+            let mut dirty: HashSet<Id> = near.iter().flat_map(|id| adj.get(id).into_iter().flatten().map(|&(lid, _)| lid)).collect();
+            // And links being shaped by hand.
+            dirty.extend(m.links.iter().filter(|l| l.route.as_ref() != p.hand.get(&l.id)).map(|l| l.id));
+            dirty
         });
+        let hand: HashMap<Id, opm_core::Route> = m.links.iter().filter_map(|l| Some((l.id, l.route.clone()?))).collect();
 
         // Parallel links between the same pair fan out (straight style).
         let mut pairs: HashMap<(Id, Id), Vec<Id>> = HashMap::new();
@@ -573,11 +634,20 @@ impl Routes {
             let sf = spread.get(&(l.id, f.id)).copied().unwrap_or(0.0);
             let st = spread.get(&(l.id, t.id)).copied().unwrap_or(0.0);
             let g = grid.as_ref().map(|g| (g, [f.id, t.id]));
-            raw.insert(l.id, link_routes(l, f, t, style, off, (sf, st), g));
+            let effect_pair = l.kind == LinkKind::Effect && l.from_state.is_some() && l.to_state.is_some();
+            let routes = match &l.route {
+                // ponytail: effects drawn as two pieces (in-state, out-state) stay automatic.
+                Some(r) if !effect_pair => vec![hand_route(l, r, f, t, style)],
+                _ => link_routes(l, f, t, style, off, (sf, st), g),
+            };
+            raw.insert(l.id, routes);
         }
         let mut drawn = raw.clone();
         if style == LinkStyle::Orthogonal {
-            nudge(&mut drawn);
+            // Hand-shaped links are where the user put them.
+            let mut auto: HashMap<Id, Vec<Route>> = raw.iter().filter(|(id, _)| !hand.contains_key(id)).map(|(id, r)| (*id, r.clone())).collect();
+            nudge(&mut auto);
+            drawn.extend(auto);
         }
         // Unchanged links keep their geometry (and DOM).
         let same = prev.filter(|p| p.style == style);
@@ -590,7 +660,7 @@ impl Routes {
                 None => links.insert(l.id, Arc::new(geo(l, routes, style))),
             };
         }
-        Routes { style, links, raw, boxes, link_ids }
+        Routes { style, links, raw, hand, boxes, link_ids }
     }
 
     /// The link under `p`, if any.
@@ -638,6 +708,101 @@ impl Route {
                 pts.reverse();
                 Route::Ortho(pts)
             }
+            Route::Spline(mut pts) => {
+                pts.reverse();
+                Route::Spline(pts)
+            }
+        }
+    }
+}
+
+/// Drops repeated points and middle points of straight right-angle runs (also back-and-forth ones).
+fn simplify(pts: Vec<P>) -> Vec<P> {
+    let mut v: Vec<P> = vec![];
+    for p in pts {
+        if v.last().is_none_or(|l: &P| dist(*l, p) > 0.5) {
+            v.push(p);
+        }
+    }
+    let mut i = 1;
+    while i + 1 < v.len() {
+        let (a, b, c) = (v[i - 1], v[i], v[i + 1]);
+        let line = ((a.0 - b.0).abs() < 0.5 && (b.0 - c.0).abs() < 0.5) || ((a.1 - b.1).abs() < 0.5 && (b.1 - c.1).abs() < 0.5);
+        if line {
+            v.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    v
+}
+
+/// One end of a hand-shaped link: the point on the shape and the direction it leaves in.
+/// `anchor` (fractions of the thing's box) wins; otherwise it faces `toward`.
+fn hand_end(shape: &Shape, t: &Thing, anchor: Option<(f64, f64)>, toward: P, style: LinkStyle) -> (P, P) {
+    let normal = |p: P| {
+        let (dx, dy) = ((p.0 - shape.cx) / shape.hw.max(1.0), (p.1 - shape.cy) / shape.hh.max(1.0));
+        if style == LinkStyle::Orthogonal || !shape.ellipse {
+            if dy.abs() >= dx.abs() { (0.0, dy.signum()) } else { (dx.signum(), 0.0) }
+        } else {
+            let l = (dx * dx + dy * dy).sqrt().max(1e-6);
+            (dx / l, dy / l)
+        }
+    };
+    if let Some((u, v)) = anchor {
+        let (w, h) = size(t);
+        let p = clip(shape, (t.x + u * w, t.y + v * h));
+        return (p, normal(p));
+    }
+    if style == LinkStyle::Orthogonal {
+        let (vertical, sg) = side(shape, &point(toward));
+        let off = if vertical { toward.0 - shape.cx } else { toward.1 - shape.cy };
+        let p = port_at(shape, (vertical, sg as f64), off);
+        return (p, if vertical { (0.0, sg as f64) } else { (sg as f64, 0.0) });
+    }
+    let p = clip(shape, toward);
+    (p, normal(p))
+}
+
+/// A link the user shaped in this diagram: through its points, from its ends' anchors.
+fn hand_route(l: &Link, hand: &opm_core::Route, f: &Thing, t: &Thing, style: LinkStyle) -> Route {
+    let obj_from = f.kind == Kind::Object && t.kind == Kind::Process;
+    let obj_to = f.kind == Kind::Process && t.kind == Kind::Object;
+    let state = l.from_state.or(l.to_state);
+    // An end on a state pill stays on its pill.
+    let (fs, fa) = if obj_from && state.is_some() { (pill_or_body(f, state), None) } else { (shape_of(f), hand.from) };
+    let (ts, ta) = if obj_to && state.is_some() { (pill_or_body(t, state), None) } else { (shape_of(t), hand.to) };
+    let ws = &hand.points;
+    let (p0, n0) = hand_end(&fs, f, fa, ws.first().copied().unwrap_or((ts.cx, ts.cy)), style);
+    let (q, n1) = hand_end(&ts, t, ta, ws.last().copied().unwrap_or((fs.cx, fs.cy)), style);
+    match style {
+        LinkStyle::Straight => Route::Ortho(std::iter::once(p0).chain(ws.iter().copied()).chain([q]).collect()),
+        LinkStyle::Curved if ws.is_empty() => {
+            let k = (dist(p0, q) / 2.5).max(30.0);
+            Route::Curve(p0, (p0.0 + n0.0 * k, p0.1 + n0.1 * k), (q.0 + n1.0 * k, q.1 + n1.1 * k), q)
+        }
+        LinkStyle::Curved => Route::Spline(std::iter::once(p0).chain(ws.iter().copied()).chain([q]).collect()),
+        LinkStyle::Orthogonal => {
+            // Leave and enter straight out of the sides, pass through every point at right angles.
+            let s0 = (p0.0 + n0.0 * 16.0, p0.1 + n0.1 * 16.0);
+            let s1 = (q.0 + n1.0 * 16.0, q.1 + n1.1 * 16.0);
+            let mut pts = vec![p0, s0];
+            let mut vertical = n0.0 == 0.0;
+            for &b in ws {
+                let a = *pts.last().unwrap();
+                if (a.0 - b.0).abs() > 0.5 && (a.1 - b.1).abs() > 0.5 {
+                    pts.push(if vertical { (a.0, b.1) } else { (b.0, a.1) });
+                }
+                pts.push(b);
+                vertical = (pts[pts.len() - 2].0 - b.0).abs() < 0.5;
+            }
+            // The last turn lines up with the side it enters.
+            let a = *pts.last().unwrap();
+            if (a.0 - s1.0).abs() > 0.5 && (a.1 - s1.1).abs() > 0.5 {
+                pts.push(if n1.0 == 0.0 { (s1.0, a.1) } else { (a.0, s1.1) });
+            }
+            pts.extend([s1, q]);
+            Route::Ortho(simplify(pts))
         }
     }
 }
@@ -705,6 +870,39 @@ mod tests {
         }
         // Pills are ordered toward their processes: draft (linked left) before final (linked right).
         assert_eq!(pills.iter().map(|b| b.0).collect::<Vec<_>>(), [draft, fin]);
+    }
+
+    #[test]
+    fn hand_routes_pass_through_their_points_at_right_angles() {
+        let mut m = Model::new("t");
+        let a = thing(&mut m, "Source", Kind::Object, 0.0, 0.0);
+        let b = thing(&mut m, "Using", Kind::Process, 400.0, 300.0);
+        let l = m.apply(Op::AddLink { from: a, to: b, kind: LinkKind::Consumption, from_state: None, to_state: None }).unwrap();
+        // The user dragged the middle of the link to y = 200.
+        m.apply(Op::SetRoute { opd: None, link: l, points: vec![(250.0, 200.0)], from: None, to: None }).unwrap();
+        let ortho = |m: &Model| {
+            let r = Routes::compute(&m.view(m.root()), LinkStyle::Orthogonal, None, false);
+            r.links[&l].pts[0].clone()
+        };
+        let pts = ortho(&m);
+        assert!(pts.windows(2).all(|w| (w[0].0 - w[1].0).abs() < 0.5 || (w[0].1 - w[1].1).abs() < 0.5), "right angles: {pts:?}");
+        assert!(pts.windows(2).any(|w| (w[0].1 - 200.0).abs() < 0.5 && (w[1].1 - 200.0).abs() < 0.5), "runs along y = 200: {pts:?}");
+        // Moving one end keeps the user's middle and the ends stay attached.
+        m.apply(Op::Move { opd: None, id: b, x: 600.0, y: 320.0, auto: false }).unwrap();
+        let pts = ortho(&m);
+        assert!(pts.windows(2).any(|w| (w[0].1 - 200.0).abs() < 0.5 && (w[1].1 - 200.0).abs() < 0.5), "{pts:?}");
+        let end = *pts.last().unwrap();
+        assert!(end.0 >= 600.0 && end.1 >= 320.0 - 0.5, "ends on the moved process: {pts:?}");
+        // An anchored end sits where it was pinned: the right middle of the object's box.
+        m.apply(Op::SetRoute { opd: None, link: l, points: vec![(250.0, 200.0)], from: Some((1.0, 0.5)), to: None }).unwrap();
+        let v = m.view(m.root());
+        let (w, h) = size(v.thing(a).unwrap());
+        assert_eq!(ortho(&m)[0], (w, h / 2.0));
+        // Curved and straight routes go through the point too.
+        for style in [LinkStyle::Straight, LinkStyle::Curved] {
+            let r = Routes::compute(&v, style, None, false);
+            assert!(r.links[&l].pts[0].iter().any(|p| dist(*p, (250.0, 200.0)) < 1.0), "{style:?}");
+        }
     }
 
     #[test]

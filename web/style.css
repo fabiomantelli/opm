@@ -424,3 +424,11 @@ select.chip.add { appearance: none; cursor: pointer; }
 .sim-log { margin: 8px 0 0; padding-left: 20px; font-size: 13px; max-height: 140px; overflow: auto; }
 .sim-log li:last-child { font-weight: 600; }
 @media (prefers-reduced-motion: reduce) { .thing { transition: none; } }
+
+/* shaping links by hand */
+.grip { stroke: var(--accent); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.grip.end { fill: var(--panel); }
+.grip.bend { fill: var(--accent); }
+.grip.add { fill: var(--panel); opacity: .75; }
+.grip.add:hover { opacity: 1; }
+.route-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

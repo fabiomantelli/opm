@@ -109,6 +109,29 @@ pub struct Opd {
     pub unfold: bool,
     #[serde(default)]
     pub shows: Vec<Shown>,
+    /// Links routed by hand in this diagram.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<Route>,
+}
+
+/// A link's route as the user shaped it in one diagram. Positions are model coordinates.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Route {
+    pub link: Id,
+    /// Points the link passes through, in order from its `from` end.
+    #[serde(default)]
+    pub points: Vec<(f64, f64)>,
+    /// Where each end attaches, as a fraction (0..1, 0..1) of its thing's box; None = automatic.
+    #[serde(default)]
+    pub from: Option<(f64, f64)>,
+    #[serde(default)]
+    pub to: Option<(f64, f64)>,
+}
+
+impl Route {
+    pub fn is_auto(&self) -> bool {
+        self.points.is_empty() && self.from.is_none() && self.to.is_none()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -169,6 +192,9 @@ pub struct Link {
     /// How many of the object/part end: "4", "0..1", "1..*", "2..5", "*". Empty = one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub multiplicity: String,
+    /// In a diagram view: the route drawn by hand there, if any (stored in `Opd::routes`).
+    #[serde(default, skip_serializing)]
+    pub route: Option<Route>,
 }
 
 impl Link {
@@ -329,6 +355,18 @@ pub enum Op {
         #[serde(default, rename = "final")]
         final_: Option<bool>,
     },
+    /// Shapes a link by hand in diagram `opd` (default: the root). No points and no ends = automatic again.
+    SetRoute {
+        #[serde(default)]
+        opd: Option<Id>,
+        link: Id,
+        #[serde(default)]
+        points: Vec<(f64, f64)>,
+        #[serde(default)]
+        from: Option<(f64, f64)>,
+        #[serde(default)]
+        to: Option<(f64, f64)>,
+    },
     /// Groups links (same kind, one shared end) as XOR/OR alternatives; `kind: None` ungroups them.
     /// Returns the fan id (or the first link's id when ungrouping).
     Fan {
@@ -405,7 +443,7 @@ impl Model {
         if self.opds.is_empty() {
             let shows = self.things.iter().map(|t| Shown { thing: t.id, x: t.x, y: t.y, auto: t.auto, inside: false }).collect();
             let id = self.fresh();
-            self.opds.push(Opd { id, parent: None, refines: None, unfold: false, shows });
+            self.opds.push(Opd { id, parent: None, refines: None, unfold: false, shows, routes: vec![] });
         }
     }
 
@@ -438,6 +476,9 @@ impl Model {
         for o in &self.opds {
             if o.parent.is_some_and(|p| self.opd(p).is_none()) || o.refines.is_some_and(|t| self.thing(t).is_none()) {
                 return Err(format!("diagram {} points to something missing", o.id));
+            }
+            if o.routes.iter().any(|r| !self.links.iter().any(|l| l.id == r.link)) {
+                return Err(format!("diagram {} routes a missing link", o.id));
             }
             if o.shows.iter().any(|s| self.thing(s.thing).is_none()) {
                 return Err(format!("diagram {} shows a missing thing", o.id));
@@ -546,6 +587,9 @@ impl Model {
             })
             .cloned()
             .collect();
+        for l in &mut v.links {
+            l.route = o.routes.iter().find(|r| r.link == l.id).cloned();
+        }
         v.fans = self.fans.clone();
         v.prune_fans();
         v.requirements = self.requirements.clone();
@@ -658,6 +702,10 @@ impl Model {
             }
         }
         self.prune_fans();
+        let links: HashSet<Id> = self.links.iter().map(|l| l.id).collect();
+        for o in &mut self.opds {
+            o.routes.retain(|r| links.contains(&r.link));
+        }
         let things: HashSet<Id> = self.things.iter().map(|t| t.id).collect();
         for r in &mut self.requirements {
             r.satisfied_by.retain(|t| things.contains(t));
@@ -788,7 +836,7 @@ impl Model {
                     }
                 }
                 let id = self.fresh();
-                self.opds.push(Opd { id, parent: Some(parent), refines: Some(thing), unfold, shows });
+                self.opds.push(Opd { id, parent: Some(parent), refines: Some(thing), unfold, shows, routes: vec![] });
                 let moves = layout::tidy_opd(self, id);
                 let o = self.opd_mut(id)?;
                 for (t, x, y) in moves {
@@ -849,7 +897,7 @@ impl Model {
                     return Err("link already exists".into());
                 }
                 let id = self.fresh();
-                self.links.push(Link { id, from, to, kind, from_state, to_state, modifier: Modifier::None, multiplicity: String::new() });
+                self.links.push(Link { id, from, to, kind, from_state, to_state, modifier: Modifier::None, multiplicity: String::new(), route: None });
                 Ok(id)
             }
             Op::Rename { id, name } => {
@@ -923,6 +971,20 @@ impl Model {
                     l.multiplicity = m;
                 }
                 Ok(id)
+            }
+            Op::SetRoute { opd, link, points, from, to } => {
+                self.links.iter().find(|l| l.id == link).ok_or("no such link")?;
+                if points.iter().chain(from.iter()).chain(to.iter()).any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+                    return Err("route points must be numbers".into());
+                }
+                let opd = opd.unwrap_or(self.root());
+                let o = self.opd_mut(opd)?;
+                o.routes.retain(|r| r.link != link);
+                let r = Route { link, points, from, to };
+                if !r.is_auto() {
+                    o.routes.push(r);
+                }
+                Ok(link)
             }
             Op::SetState { id, initial, final_ } => {
                 let s = self.things.iter_mut().flat_map(|t| t.states.iter_mut()).find(|s| s.id == id).ok_or("no such state")?;
@@ -1008,6 +1070,9 @@ impl Model {
                 } else if let Some(i) = self.links.iter().position(|l| l.id == id) {
                     self.links.remove(i);
                     self.prune_fans();
+                    for o in &mut self.opds {
+                        o.routes.retain(|r| r.link != id);
+                    }
                 } else if self.state(id).is_some() {
                     for t in &mut self.things {
                         t.states.retain(|s| s.id != id);
